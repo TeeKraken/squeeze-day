@@ -67,7 +67,7 @@ export interface DrawOptions {
 /** Pixels per minute for things drawn to scale (72 px an hour). */
 export const SCALE = 1.2;
 /** Room an appointment needs for its time and one or two lines of title. */
-export const MIN_EVENT_HEIGHT = 50;
+export const MIN_EVENT_HEIGHT = 58;
 // Sizes (px) matching style.css: button padding, time line, title line.
 const EV_PAD = 8;
 const TIME_LINE = 15;

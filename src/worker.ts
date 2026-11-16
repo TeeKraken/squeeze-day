@@ -16,9 +16,10 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data;
   try {
     if (msg.type === "load") {
-      calendar = null;
-      calendar = new Calendar(msg.texts);
-      reply({ type: "loaded", id: msg.id, summary: calendar.summary });
+      // Only replace the current calendar once the new one has been read.
+      const next = new Calendar(msg.texts);
+      calendar = next;
+      reply({ type: "loaded", id: msg.id, summary: next.summary });
     } else if (msg.type === "day") {
       if (!calendar) throw new CalendarError("No calendar is loaded.");
       reply({ type: "day", id: msg.id, day: calendar.day(msg.day) });
