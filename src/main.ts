@@ -4,7 +4,7 @@ import { dayNumber, dayRange, localDayNumber } from "./logic/time";
 import { isZip, readIcsFromZip, ZipError } from "./logic/zip";
 import type { WorkerRequest, WorkerResponse } from "./protocol";
 import { loadSaved, loadThreshold, removeSaved, save, saveThreshold } from "./store";
-import { dayDate, drawAllDay, formatMonthYear, drawTimeline, formatDay, formatShortDay, timeRange, type DrawOptions } from "./view";
+import { dayDate, drawAllDay, drawTimeline, formatDay, formatShortDay, timeRange, type DrawOptions } from "./view";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -32,6 +32,8 @@ const timeline = $("timeline");
 const thresholdSelect = $<HTMLSelectElement>("threshold");
 const calInfo = $("cal-info");
 const calKeep = $("cal-keep");
+const calWarn = $("cal-warn");
+const dayWarn = $("day-warn");
 const removeBtn = $<HTMLButtonElement>("remove");
 const dialog = $<HTMLDialogElement>("details");
 const detailsTitle = $("details-title");
@@ -53,8 +55,20 @@ const state = {
   data: null as DayEvents | null,
   summary: null as CalendarSummary | null,
   names: [] as string[],
-  kept: false,
+  /** What happened when keeping the calendar on this device. */
+  kept: "yes" as "yes" | "no" | "old-copy-remains",
 };
+
+/**
+ * Every load (file, sample, restoring on start-up) and every removal starts a
+ * new generation. A load checks it's still current after each wait, so a
+ * removal (or a newer load) always wins over one still in progress.
+ */
+let generation = 0;
+const begin = () => ++generation;
+const isCurrent = (g: number) => g === generation;
+/** Saves still running (a removal must clear what they write). */
+let saving = 0;
 
 // ---- the worker that holds the calendar ----
 
@@ -102,38 +116,54 @@ function setStatus(msg: string, err = ""): void {
   for (const el of [error1, error2]) el.textContent = err;
 }
 
-let loading = 0;
-async function loadCalendar(files: { name: string; text: string }[], mode: Mode, day: number, keep: boolean): Promise<boolean> {
-  const ticket = ++loading;
+async function loadCalendar(g: number, files: { name: string; text: string }[], mode: Mode, day: number, keep: boolean): Promise<boolean> {
   setStatus(mode === "sample" ? "Opening the sample…" : "Reading your calendar…");
   const res = await ask({ type: "load", texts: files.map((f) => f.text) });
-  if (ticket !== loading) return false;
+  if (!isCurrent(g)) return false;
   if (res.type !== "loaded") {
     setStatus("", res.type === "error" ? res.message : "Something went wrong.");
     return false;
   }
+  const hadSaved = state.mode === "mine" && state.kept !== "no";
+  let kept: typeof state.kept = "yes";
+  if (keep) {
+    // Saving and removing take turns (see store.ts), so a removal started
+    // after this always runs after this save and wins.
+    saving++;
+    try {
+      if (!(await save({ files, savedAt: Date.now() }))) {
+        // Don't let an older saved copy quietly come back next time.
+        kept = (await removeSaved()) ? "no" : hadSaved ? "old-copy-remains" : "no";
+      }
+    } finally {
+      saving--;
+    }
+    if (!isCurrent(g)) return false;
+  }
+  const wasStart = !start.hidden;
   state.mode = mode;
   state.summary = res.summary;
   state.names = files.map((f) => f.name);
-  state.kept = false;
+  state.kept = kept;
   setStatus("");
-  if (keep) {
-    state.kept = await save({ files, savedAt: Date.now() });
-  }
   showDayview();
   await goTo(day);
+  // The button that started this is now hidden: put focus somewhere useful.
+  if (wasStart && isCurrent(g)) dayTitle.focus();
   return true;
 }
 
 async function onFiles(input: HTMLInputElement): Promise<void> {
   const files = input.files;
   if (!files || files.length === 0) return;
+  const g = begin();
   setStatus("Reading your calendar…");
   try {
     const read = await readFiles(files);
-    await loadCalendar(read, "mine", localDayNumber(new Date()), true);
+    if (!isCurrent(g)) return;
+    await loadCalendar(g, read, "mine", localDayNumber(new Date()), true);
   } catch (err) {
-    setStatus("", err instanceof FileProblem || err instanceof ZipError ? err.message : "That file couldn't be opened. Try choosing it again.");
+    if (isCurrent(g)) setStatus("", err instanceof FileProblem || err instanceof ZipError ? err.message : "That file couldn't be opened. Try choosing it again.");
   } finally {
     input.value = "";
   }
@@ -148,13 +178,14 @@ function showDayview(): void {
   sampleNote.hidden = state.mode !== "sample";
   const s = state.summary!;
   const what = state.mode === "sample" ? "The sample calendar" : state.names.length === 1 ? `"${state.names[0]}"` : `${state.names.length} calendars`;
-  const range =
-    s.firstDay !== null && s.lastDay !== null && s.firstDay !== s.lastDay
-      ? `, from ${formatMonthYear(s.firstDay)} to ${formatMonthYear(s.lastDay)}`
-      : "";
-  calInfo.textContent = `${what}: ${s.events.toLocaleString()} ${s.events === 1 ? "event" : "events"}${s.recurring ? ` (${s.recurring.toLocaleString()} repeating)` : ""}${range}.`;
+  calInfo.textContent = `${what}: ${s.events.toLocaleString()} ${s.events === 1 ? "event" : "events"}${s.recurring ? ` (${s.recurring.toLocaleString()} repeating)` : ""}.`;
+  calWarn.textContent = s.unreadable
+    ? `${s.unreadable.toLocaleString()} ${s.unreadable === 1 ? "event" : "events"} in this file couldn't be read, so ${s.unreadable === 1 ? "it isn't" : "they aren't"} shown. Check them in your calendar app.`
+    : "";
   if (state.mode === "sample") calKeep.textContent = "The sample isn't kept. Add your own calendar to keep it on this device.";
-  else if (state.kept) calKeep.textContent = "Your calendar stays on this device, so it's here when you come back. It's a copy: add a newer copy to see later changes.";
+  else if (state.kept === "yes") calKeep.textContent = "Your calendar stays on this device, so it's here when you come back. It's a copy: add a newer copy to see later changes.";
+  else if (state.kept === "old-copy-remains")
+    calKeep.textContent = "This browser wouldn't save this newer copy, and couldn't clear the older one. Next time the older copy will open instead. Use \"Remove this calendar\" to clear it.";
   else calKeep.textContent = "This browser wouldn't let the app keep your calendar, so you'll need to add it again next time. Nothing was uploaded.";
   removeBtn.textContent = state.mode === "sample" ? "Close the sample" : "Remove this calendar";
 }
@@ -176,7 +207,7 @@ async function goTo(day: number, focusTitle = false): Promise<void> {
     /* not important */
   }
   const res = await ask({ type: "day", day });
-  if (ticket !== dayTicket) return;
+  if (ticket !== dayTicket || state.mode === "none") return;
   if (res.type !== "day") {
     setStatus("", res.type === "error" ? res.message : "Something went wrong.");
     return;
@@ -204,8 +235,15 @@ function draw(): void {
     },
     onEvent: showDetails,
   };
+  // Redrawing replaces whatever was focused inside the day; keep focus on the page.
+  const active = document.activeElement;
+  const focusWasInDay = !!active && (timeline.contains(active) || alldayList.contains(active));
   drawAllDay(alldayList, alldayWrap, data, opts);
   drawTimeline(timeline, data, opts);
+  if (focusWasInDay) dayTitle.focus();
+  dayWarn.textContent = data.failedSeries
+    ? `${data.failedSeries === 1 ? "A repeating event" : `${data.failedSeries} repeating events`} couldn't be worked out, so this day may be missing ${data.failedSeries === 1 ? "it" : "them"}.`
+    : "";
   const n = data.timed.length;
   const a = data.allDay.length;
   const parts: string[] = [];
@@ -248,17 +286,21 @@ fileInput.addEventListener("change", () => void onFiles(fileInput));
 fileInput2.addEventListener("change", () => void onFiles(fileInput2));
 
 sampleBtn.addEventListener("click", async () => {
+  const g = begin();
   setStatus("Opening the sample…");
   try {
     const res = await fetch("/sample-calendar.ics");
     if (!res.ok) throw new Error(String(res.status));
-    await loadCalendar([{ name: "sample-calendar.ics", text: await res.text() }], "sample", SAMPLE_DAY, false);
+    const text = await res.text();
+    if (!isCurrent(g)) return;
+    await loadCalendar(g, [{ name: "sample-calendar.ics", text }], "sample", SAMPLE_DAY, false);
   } catch {
-    setStatus("", "The sample couldn't be loaded. Check your connection and try again.");
+    if (isCurrent(g)) setStatus("", "The sample couldn't be loaded. Check your connection and try again.");
   }
 });
 
 function backToStart(): void {
+  begin(); // anything still loading is now out of date
   void ask({ type: "clear" });
   state.mode = "none";
   state.data = null;
@@ -281,11 +323,16 @@ sampleOwn.addEventListener("click", () => {
 });
 
 removeBtn.addEventListener("click", async () => {
-  if (state.mode === "mine") {
-    const ok = await removeSaved();
-    backToStart();
-    setStatus(ok ? "Your calendar was removed from this device." : "", ok ? "" : "The app couldn't clear its storage. Clear this site's data in your browser settings to be sure.");
-  } else backToStart();
+  const wasMine = state.mode === "mine";
+  const savePending = saving > 0;
+  backToStart();
+  // The sample is never saved, so closing it leaves a saved calendar alone,
+  // unless a calendar was still being saved when the sample was closed.
+  if (!wasMine && !savePending) return;
+  const g = generation;
+  const ok = await removeSaved();
+  if (!isCurrent(g)) return;
+  if (wasMine) setStatus(ok ? "Your calendar was removed from this device." : "", ok ? "" : "The app couldn't clear its storage. Clear this site's data in your browser settings to be sure.");
 });
 
 prevBtn.addEventListener("click", () => void goTo(state.day - 1));
@@ -348,12 +395,8 @@ function dayFromHash(): number | null {
     thresholdSelect.value = t;
     state.threshold = t === "never" ? Infinity : Number(t);
   }
+  const g = begin();
   const saved = await loadSaved();
-  if (saved && saved.files.length && state.mode === "none") {
-    const ok = await loadCalendar(saved.files, "mine", dayFromHash() ?? localDayNumber(new Date()), false);
-    if (ok) {
-      state.kept = true;
-      showDayview();
-    }
-  }
+  if (!isCurrent(g)) return;
+  if (saved && saved.files.length) await loadCalendar(g, saved.files, "mine", dayFromHash() ?? localDayNumber(new Date()), false);
 })();

@@ -16,6 +16,8 @@
   --gap-ink: #7a8494;
   --error: #b42318;
   --danger: #b42318;
+  --warn-bg: #fff4d6;
+  --warn-ink: #5c3d00;
   --radius: 14px;
   --gutter: 52px;
   color-scheme: light dark;
@@ -40,6 +42,8 @@
     --gap-ink: #8b94a3;
     --error: #ff8a80;
     --danger: #ff8a80;
+    --warn-bg: #3a3014;
+    --warn-ink: #ffe3a3;
   }
 }
 
@@ -255,6 +259,16 @@ h2 {
   font-weight: 600;
   margin: 6px 0 0;
 }
+.warn {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 0.92rem;
+}
+.warn:empty {
+  display: none;
+}
 .hint {
   color: var(--muted);
   font-size: 0.92rem;
@@ -454,6 +468,17 @@ h2 {
   border-left: 2px dotted var(--line);
   margin-left: 6px;
 }
+.gap-covered {
+  border-left: 2px solid var(--ev-edge);
+}
+.gap-covered .gap-label {
+  color: var(--ev-ink);
+}
+.fold-covered .fold-btn {
+  background: repeating-linear-gradient(-45deg, var(--ev-bg) 0 6px, var(--fold-b) 6px 12px);
+  color: var(--ev-ink);
+  box-shadow: inset 4px 0 0 var(--ev-edge);
+}
 .gap-label {
   font-size: 0.75rem;
   color: var(--gap-ink);
@@ -490,9 +515,12 @@ h2 {
   cursor: pointer;
   overflow: hidden;
 }
-.ev-time {
+.ev-times {
   display: block;
   flex: none;
+}
+.ev-time {
+  display: block;
   font-size: 0.75rem;
   line-height: 15px;
   height: 15px;

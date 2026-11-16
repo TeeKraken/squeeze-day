@@ -5,10 +5,14 @@
  * Time runs down the page. Busy time and short free gaps are drawn to scale,
  * so "back to back" and "five minutes apart" look different. Free stretches
  * longer than the threshold fold into a thin strip labelled with their length.
- * Every appointment gets at least `minEventHeight` so its time and title stay
- * readable; when one needs more room, the time axis stretches there, so
- * nothing ever covers the block after it. Overlapping appointments sit side by
- * side in columns.
+ * Every appointment gets at least `minEventHeight` (side-by-side ones
+ * `minSideHeight`) so its time and title stay readable; when one needs more
+ * room, the time axis stretches there, so nothing ever covers the block after
+ * it. Overlapping appointments sit side by side in columns.
+ *
+ * Time taken by an event shown in the all-day row (a timed event that covers
+ * the whole day, like a trip) is "covered": never called free, and folded
+ * into a strip named after that event when long.
  */
 
 export interface LayoutEvent {
@@ -16,6 +20,13 @@ export interface LayoutEvent {
   /** Minutes from the start of the day (may be fractional). */
   start: number;
   end: number;
+}
+
+export interface Covered {
+  start: number;
+  end: number;
+  /** What's taking the time, e.g. "Conference". */
+  title: string;
 }
 
 export interface LayoutOptions {
@@ -26,15 +37,18 @@ export interface LayoutOptions {
   /** Pixels per minute for things drawn to scale. */
   scale?: number;
   minEventHeight?: number;
+  /** Minimum height for appointments sharing the width with others (they need more lines). */
+  minSideHeight?: number;
   squeezedHeight?: number;
   /** Start minutes of squeezed gaps the person has opened back to full size. */
   expanded?: ReadonlySet<number>;
+  covered?: Covered[];
 }
 
 export type Block =
   | { kind: "event"; id: string; start: number; end: number; top: number; height: number; column: number; columns: number }
-  | { kind: "gap"; start: number; end: number; top: number; height: number; expanded: boolean }
-  | { kind: "squeezed"; start: number; end: number; top: number; height: number; label: string };
+  | { kind: "gap"; start: number; end: number; top: number; height: number; expanded: boolean; covered?: string }
+  | { kind: "squeezed"; start: number; end: number; top: number; height: number; label: string; covered?: string };
 
 export interface DayLayout {
   height: number;
@@ -52,14 +66,18 @@ export const DEFAULTS = {
   squeezedHeight: 30,
 };
 
-/** "45 min free", "3 h free", "2 h 30 free". */
-export function freeLabel(minutes: number, wholeDay = false): string {
-  if (wholeDay) return "Free all day";
+/** "45 min", "3 h", "2 h 30". */
+export function lengthLabel(minutes: number): string {
   const m = Math.round(minutes);
-  if (m < 60) return `${m} min free`;
+  if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
   const rest = m % 60;
-  return rest === 0 ? `${h} h free` : `${h} h ${String(rest).padStart(2, "0")} free`;
+  return rest === 0 ? `${h} h` : `${h} h ${String(rest).padStart(2, "0")}`;
+}
+
+/** "45 min free", "3 h free", "2 h 30 free". */
+export function freeLabel(minutes: number, wholeDay = false): string {
+  return wholeDay ? "Free all day" : `${lengthLabel(minutes)} free`;
 }
 
 interface Placed {
@@ -105,39 +123,73 @@ function assignColumns(events: LayoutEvent[], dayMinutes: number): Placed[] {
   return placed;
 }
 
+interface Piece {
+  start: number;
+  end: number;
+  busy: boolean;
+  covered: string[];
+  height: number;
+  squeezed: boolean;
+}
+
 export function layoutDay(events: LayoutEvent[], options: LayoutOptions = {}): DayLayout {
   const dayMinutes = options.dayMinutes ?? DEFAULTS.dayMinutes;
   const threshold = options.threshold ?? DEFAULTS.threshold;
   const scale = options.scale ?? DEFAULTS.scale;
   const minH = options.minEventHeight ?? DEFAULTS.minEventHeight;
+  const minSide = options.minSideHeight ?? minH;
   const squeezedH = options.squeezedHeight ?? DEFAULTS.squeezedHeight;
   const expanded = options.expanded ?? new Set<number>();
+  const covered = (options.covered ?? [])
+    .map((c) => ({ ...c, start: Math.max(0, c.start), end: Math.min(dayMinutes, c.end) }))
+    .filter((c) => c.end > c.start);
 
   const placed = assignColumns(events, dayMinutes);
 
-  // Cut the day at every start and end; each piece is busy or free.
+  // Cut the day at every start and end; each piece is busy, covered or free.
   const cuts = new Set<number>([0, dayMinutes]);
   for (const p of placed) {
     cuts.add(p.start);
     cuts.add(p.effEnd);
   }
+  for (const c of covered) {
+    cuts.add(c.start);
+    cuts.add(c.end);
+  }
   const points = [...cuts].sort((a, b) => a - b);
-  const segs = points.slice(0, -1).map((a, i) => ({ start: a, end: points[i + 1], busy: false, height: 0, squeezed: false }));
-  const segIndex = new Map(points.map((p, i) => [p, i]));
+  const raw: Piece[] = points.slice(0, -1).map((a, i) => ({ start: a, end: points[i + 1], busy: false, covered: [], height: 0, squeezed: false }));
+  const rawIndex = new Map(points.map((p, i) => [p, i]));
 
-  // Mark busy pieces with a difference array over segment indexes.
-  const diff = new Array(segs.length + 1).fill(0);
+  // Mark busy pieces with a difference array over piece indexes.
+  const diff = new Array(raw.length + 1).fill(0);
   for (const p of placed) {
-    diff[segIndex.get(p.start)!]++;
-    diff[segIndex.get(p.effEnd)!]--;
+    diff[rawIndex.get(p.start)!]++;
+    diff[rawIndex.get(p.effEnd)!]--;
   }
   let running = 0;
-  for (let i = 0; i < segs.length; i++) {
+  for (let i = 0; i < raw.length; i++) {
     running += diff[i];
-    segs[i].busy = running > 0;
+    raw[i].busy = running > 0;
+  }
+  for (const c of covered) {
+    for (let i = rawIndex.get(c.start)!; i < rawIndex.get(c.end)!; i++) {
+      if (!raw[i].covered.includes(c.title)) raw[i].covered.push(c.title);
+    }
   }
 
-  for (const s of segs) {
+  // Join neighbouring free (or identically covered) pieces, so one stretch is one strip.
+  const pieces: Piece[] = [];
+  for (const s of raw) {
+    const prev = pieces[pieces.length - 1];
+    if (prev && !prev.busy && !s.busy && prev.covered.join("\n") === s.covered.join("\n")) prev.end = s.end;
+    else pieces.push({ ...s });
+  }
+  // Event edges always border a busy piece, so they survive the joining.
+  const index = new Map<number, number>();
+  pieces.forEach((s, i) => index.set(s.start, i));
+  index.set(dayMinutes, pieces.length);
+
+  for (const s of pieces) {
     const len = s.end - s.start;
     if (!s.busy && len > threshold && !expanded.has(s.start)) {
       s.squeezed = true;
@@ -147,55 +199,44 @@ export function layoutDay(events: LayoutEvent[], options: LayoutOptions = {}): D
 
   // Give every appointment room to read; stretch its last piece if needed.
   for (const p of placed) {
-    const a = segIndex.get(p.start)!;
-    const b = segIndex.get(p.effEnd)!;
+    const a = index.get(p.start)!;
+    const b = index.get(p.effEnd)!;
     let h = 0;
-    for (let i = a; i < b; i++) h += segs[i].height;
-    if (h < minH) segs[b - 1].height += minH - h;
+    for (let i = a; i < b; i++) h += pieces[i].height;
+    const need = p.columns > 1 ? minSide : minH;
+    if (h < need) pieces[b - 1].height += need - h;
   }
 
   const tops: number[] = [];
   let y = 0;
-  for (const s of segs) {
+  for (const s of pieces) {
     tops.push(y);
     y += s.height;
   }
   tops.push(y);
 
   const blocks: Block[] = [];
-  const wholeDayFree = placed.length === 0;
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i];
+  const wholeDayFree = placed.length === 0 && covered.length === 0;
+  for (let i = 0; i < pieces.length; i++) {
+    const s = pieces[i];
     if (s.busy || s.end <= s.start) continue;
+    const coveredBy = s.covered.length ? s.covered.join(", ") : undefined;
+    const extra = coveredBy ? { covered: coveredBy } : {};
     if (s.squeezed) {
-      blocks.push({
-        kind: "squeezed",
-        start: s.start,
-        end: s.end,
-        top: tops[i],
-        height: s.height,
-        label: freeLabel(s.end - s.start, wholeDayFree),
-      });
+      const whole = s.start === 0 && s.end === dayMinutes;
+      const label = coveredBy ? `${whole ? "All day" : lengthLabel(s.end - s.start)} · ${coveredBy}` : freeLabel(s.end - s.start, wholeDayFree);
+      blocks.push({ kind: "squeezed", start: s.start, end: s.end, top: tops[i], height: s.height, label, ...extra });
     } else {
-      blocks.push({ kind: "gap", start: s.start, end: s.end, top: tops[i], height: s.height, expanded: expanded.has(s.start) && s.end - s.start > threshold });
+      blocks.push({ kind: "gap", start: s.start, end: s.end, top: tops[i], height: s.height, expanded: expanded.has(s.start) && s.end - s.start > threshold, ...extra });
     }
   }
   for (const p of placed) {
-    const a = segIndex.get(p.start)!;
-    const b = segIndex.get(p.effEnd)!;
-    blocks.push({
-      kind: "event",
-      id: p.id,
-      start: p.start,
-      end: p.end,
-      top: tops[a],
-      height: tops[b] - tops[a],
-      column: p.column,
-      columns: p.columns,
-    });
+    const a = index.get(p.start)!;
+    const b = index.get(p.effEnd)!;
+    blocks.push({ kind: "event", id: p.id, start: p.start, end: p.end, top: tops[a], height: tops[b] - tops[a], column: p.column, columns: p.columns });
   }
   blocks.sort((x, z) => x.top - z.top || x.start - z.start || (x.kind === "event" && z.kind === "event" ? x.column - z.column : 0));
-  const axis = segs.map((s, i) => ({ start: s.start, end: s.end, top: tops[i], height: s.height, squeezed: s.squeezed }));
+  const axis = pieces.map((s, i) => ({ start: s.start, end: s.end, top: tops[i], height: s.height, squeezed: s.squeezed }));
   return { height: y, blocks, axis };
 }
 

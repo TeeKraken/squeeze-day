@@ -1,15 +1,35 @@
 /**
  * Reads .ics calendar files (with ical.js) and answers "what's on this day?".
  *
- * Parsing happens once. Recurring events are expanded lazily, only as far as
- * the days someone actually views, and the occurrences found are kept so
- * going back and forth stays fast even for big calendars with years of events.
+ * ical.js parses the file and generates the clock times a repeat rule
+ * produces. Everything that depends on time zones is done here instead:
+ * converting clock times to real instants, the UNTIL cut-off, EXDATE and
+ * RECURRENCE-ID matching, RDATEs in their own zones, skipping clock times
+ * that don't exist (the hour lost when clocks go forward), and day/week
+ * DURATIONs that keep the clock time across daylight saving changes.
+ *
+ * Parsing happens once. Repeating events are expanded lazily, only around the
+ * days someone actually views, and the occurrences found are kept so going
+ * back and forth stays fast even for big calendars with years of events.
  */
 import ICAL from "ical.js";
-import { dayNumber, dayNumberToDate, dayRange, floatingToInstant, resolveZone, wallToInstant, type Wall } from "./time";
+import {
+  addDaysToWall,
+  dayNumber,
+  dayNumberToDate,
+  dayRange,
+  floatingToInstant,
+  resolveZone,
+  wallExists,
+  wallToInstant,
+  type Wall,
+} from "./time";
 
 type ICALTime = InstanceType<typeof ICAL.Time>;
 type ICALComponent = InstanceType<typeof ICAL.Component>;
+type ICALRecur = InstanceType<typeof ICAL.Recur>;
+type ICALDuration = InstanceType<typeof ICAL.Duration>;
+type RecurIterator = ReturnType<ICALRecur["iterator"]>;
 
 export class CalendarError extends Error {}
 
@@ -38,15 +58,26 @@ export interface DayEvents {
   day: number;
   allDay: AllDayItem[];
   timed: DayEvent[];
+  /** How many repeating events couldn't be worked out for this day (so aren't shown). */
+  failedSeries: number;
 }
 
 export interface CalendarSummary {
   events: number;
   recurring: number;
   calendars: number;
-  /** Day numbers of the earliest and latest event start found (recurring series count by their first). */
-  firstDay: number | null;
-  lastDay: number | null;
+  /** Events the app couldn't read at all (no usable start time, or a repeat rule it can't follow). */
+  unreadable: number;
+}
+
+/** How long an event lasts: exact elapsed time, or calendar days/weeks plus a time (keeps the clock time across DST). */
+type Length = { exact: number } | { days: number; ms: number };
+
+/** Converts clock times in one zone to instants. */
+interface Zoner {
+  toInstant(w: Wall): number;
+  /** Whether this clock time happens at all (false in the hour skipped when clocks go forward). */
+  exists(w: Wall): boolean;
 }
 
 interface Single extends EventInfo {
@@ -57,34 +88,70 @@ interface Single extends EventInfo {
   end: number;
 }
 
+interface Occurrence {
+  key: number;
+  end: number;
+}
+
+/** A RECURRENCE-ID;RANGE=THISANDFUTURE change: applies to every later occurrence. */
+interface FutureChange extends EventInfo {
+  fromKey: number;
+  shift: number;
+  length: number;
+  cancelled: boolean;
+}
+
+interface RuleState {
+  it: RecurIterator;
+  count: number | null;
+  n: number;
+  untilKey: number | null;
+  untilDay: number | null;
+  /** The next value is the series start itself (always an occurrence, even in a skipped hour). */
+  first: boolean;
+  peek: (Occurrence & { day: number }) | null;
+}
+
 interface Series extends EventInfo {
   id: string;
   allDay: boolean;
-  component: ICALComponent;
+  /** The start as a plain clock time (no zone), which repeat rules run on. */
   dtstart: ICALTime;
-  zone: string | null;
-  /** Timed: length in ms. All-day: length in days. */
-  length: number;
-  /** Original-occurrence keys that are replaced by an override or excluded. */
+  zoner: Zoner;
+  /** Timed: Length. All-day: days. */
+  length: Length | number;
+  /** Longest occurrence, in ms (timed) or days (all-day), for searching back from a day. */
+  maxLength: number;
+  rules: { recur: ICALRecur; count: number | null; untilKey: number | null; untilDay: number | null }[];
+  /** The start itself and every RDATE, each in its own zone. */
+  extra: Occurrence[];
+  /** Occurrences replaced by an override or excluded (keys). */
   skip: Set<number>;
+  /** EXDATEs given as plain dates for a timed series: every occurrence on that clock date. */
+  skipDays: Set<number>;
+  future: FutureChange[];
+  shiftMin: number;
+  shiftMax: number;
   /** How to jump ahead in the series without walking every earlier occurrence, if safe. */
   jump: { freq: "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY"; interval: number } | null;
-  expansion: InstanceType<typeof ICAL.RecurExpansion> | null;
-  /** Occurrences are known from here on (instant or day number). */
+  states: RuleState[];
+  /** Occurrences from rules are known from here on (instant or day number). */
   windowStart: number;
-  /** Occurrence starts found so far (instants or day numbers), ascending; includes skipped ones. */
+  /** Rule occurrence starts found so far, ascending, with their ends. Includes skipped ones. */
   starts: number[];
+  ends: number[];
   done: boolean;
+  failed: boolean;
 }
 
 /** Re-anchoring is worth it when the viewed day is this far past what's been expanded. */
 const FAR_DAYS = 400;
-
 /** Recurring series stop expanding after this many occurrences. */
 const MAX_OCCURRENCES = 200_000;
 /** Single events longer than this are checked on every day rather than by index. */
 const LONG_MS = 2 * 86400000;
 const LONG_DAYS = 2;
+const DAY_MS = 86400000;
 
 function text(comp: ICALComponent, name: string): string {
   const v = comp.getFirstPropertyValue(name);
@@ -95,39 +162,60 @@ function wall(t: ICALTime): Wall {
   return { year: t.year, month: t.month, day: t.day, hour: t.hour, minute: t.minute, second: t.second };
 }
 
-function tzidOf(comp: ICALComponent, prop: string): string | null {
-  const p = comp.getFirstProperty(prop);
-  const v = p?.getParameter("tzid");
+function isTime(v: unknown): v is ICALTime {
+  return !!v && typeof v === "object" && "year" in v && "isDate" in v;
+}
+
+function param(comp: ICALComponent, prop: string, name: string): string | null {
+  const v = comp.getFirstProperty(prop)?.getParameter(name);
   return typeof v === "string" ? v : null;
 }
 
+const UTC: Zoner = {
+  toInstant: (w) => Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second),
+  exists: () => true,
+};
+const FLOATING: Zoner = { toInstant: floatingToInstant, exists: (w) => wallExists(w, null) };
+const ianaZoners = new Map<string, Zoner>();
+
 /**
- * The instant of a date-time. UTC ("Z") times are exact; times with a TZID use
- * the browser's own time zone data when it knows the zone, else the zone
- * definition inside the file; times with no zone are read as local time.
+ * How to read a date-time: UTC ("Z") times are exact; times with a TZID use the
+ * browser's own time zone data when it knows the zone, else the zone
+ * definition inside the file; times with no zone are local clock time.
  */
-function instant(t: ICALTime, tzid: string | null): number {
+function zonerFor(t: ICALTime, tzid: string | null): Zoner {
   const zoneId = t.zone?.tzid;
-  if (zoneId === "UTC" || zoneId === "Z") return Date.UTC(t.year, t.month - 1, t.day, t.hour, t.minute, t.second);
+  if (zoneId === "UTC" || zoneId === "Z") return UTC;
   const name = tzid ?? (zoneId && zoneId !== "floating" ? zoneId : null);
   if (name) {
     const resolved = resolveZone(name);
-    if (resolved) return wallToInstant(wall(t), resolved);
-    // Not a zone the browser knows (e.g. a custom name): use the file's definition.
-    if (t.zone && zoneId && zoneId !== "floating" && (t.zone as { component?: unknown }).component) {
-      return t.toUnixTime() * 1000;
+    if (resolved) {
+      let z = ianaZoners.get(resolved);
+      if (!z) {
+        z = { toInstant: (w) => wallToInstant(w, resolved), exists: (w) => wallExists(w, resolved) };
+        ianaZoners.set(resolved, z);
+      }
+      return z;
+    }
+    const zone = t.zone as (typeof t.zone & { component?: unknown }) | undefined;
+    if (zone && zoneId && zoneId !== "floating" && zone.component) {
+      // A zone only the file defines: let ical.js convert with that definition.
+      return {
+        toInstant: (w) => ICAL.Time.fromData({ ...w, isDate: false }, zone).toUnixTime() * 1000,
+        exists: () => true,
+      };
     }
   }
-  return floatingToInstant(wall(t));
+  return FLOATING;
 }
 
-function dateDay(t: ICALTime): number {
+function dateDay(t: { year: number; month: number; day: number }): number {
   return dayNumber(t.year, t.month, t.day);
 }
 
-/** A key for "which occurrence is this", comparable across the forms a file may write it in. */
-function occurrenceKey(t: ICALTime, tzid: string | null, allDay: boolean): number {
-  return allDay || t.isDate ? dateDay(t) : instant(t, tzid);
+function dayNumberOfInstant(ms: number): number {
+  const d = new Date(ms);
+  return dayNumber(d.getFullYear(), d.getMonth() + 1, d.getDate());
 }
 
 function info(comp: ICALComponent): EventInfo {
@@ -138,33 +226,106 @@ function isCancelled(comp: ICALComponent): boolean {
   return text(comp, "status").toUpperCase() === "CANCELLED";
 }
 
-/** Start/end of a non-recurring event (or one override), or null if unreadable. */
-function readSingle(comp: ICALComponent, id: string): Single | null {
-  const dtstart = comp.getFirstPropertyValue("dtstart") as ICALTime | null;
-  if (!dtstart || typeof dtstart !== "object" || !("year" in dtstart)) return null;
-  const startZone = tzidOf(comp, "dtstart");
-  const dtend = comp.getFirstPropertyValue("dtend") as ICALTime | null;
-  const durationValue = comp.getFirstPropertyValue("duration") as InstanceType<typeof ICAL.Duration> | null;
+function durationOf(comp: ICALComponent): ICALDuration | null {
+  const d = comp.getFirstPropertyValue("duration");
+  return d && typeof d === "object" && "toSeconds" in d ? (d as ICALDuration) : null;
+}
+
+function endOf(w: Wall, key: number, zoner: Zoner, length: Length): number {
+  if ("exact" in length) return key + length.exact;
+  return zoner.toInstant(addDaysToWall(w, length.days)) + length.ms;
+}
+
+interface Timing {
+  allDay: boolean;
+  dtstart: ICALTime;
+  zoner: Zoner;
+  start: number;
+  /** Timed: Length. All-day: days. */
+  length: Length | number;
+}
+
+/** When an event starts and how long it lasts, or null if unreadable. */
+function readTiming(comp: ICALComponent): Timing | null {
+  const dtstart = comp.getFirstPropertyValue("dtstart");
+  if (!isTime(dtstart)) return null;
+  const dtend = comp.getFirstPropertyValue("dtend");
+  const duration = durationOf(comp);
   if (dtstart.isDate) {
     const start = dateDay(dtstart);
-    let end = start + 1;
-    if (dtend && typeof dtend === "object" && "year" in dtend) end = dateDay(dtend);
-    else if (durationValue && typeof durationValue === "object" && "toSeconds" in durationValue) {
-      end = start + Math.max(1, Math.round(durationValue.toSeconds() / 86400));
-    }
-    if (end <= start) end = start + 1;
-    return { id, ...info(comp), allDay: true, start, end };
+    let days = 1;
+    if (isTime(dtend)) days = dateDay(dtend) - start;
+    else if (duration && !duration.isNegative) days = duration.weeks * 7 + duration.days + Math.floor((duration.hours * 3600 + duration.minutes * 60 + duration.seconds) / 86400);
+    return { allDay: true, dtstart, zoner: FLOATING, start, length: Math.max(1, days) };
   }
-  const start = instant(dtstart, startZone);
-  let end = start;
-  if (dtend && typeof dtend === "object" && "year" in dtend) {
-    end = dtend.isDate ? instant(dtend, startZone) : instant(dtend, tzidOf(comp, "dtend"));
-  } else if (durationValue && typeof durationValue === "object" && "toSeconds" in durationValue) {
-    end = start + durationValue.toSeconds() * 1000;
-  }
-  if (!(end >= start)) end = start;
+  const zoner = zonerFor(dtstart, param(comp, "dtstart", "tzid"));
+  const start = zoner.toInstant(wall(dtstart));
   if (!Number.isFinite(start)) return null;
-  return { id, ...info(comp), allDay: false, start, end };
+  let length: Length = { exact: 0 };
+  if (isTime(dtend)) {
+    const end = dtend.isDate ? zoner.toInstant(wall(dtend)) : zonerFor(dtend, param(comp, "dtend", "tzid")).toInstant(wall(dtend));
+    length = { exact: Math.max(0, end - start) };
+  } else if (duration && !duration.isNegative) {
+    const ms = (duration.hours * 3600 + duration.minutes * 60 + duration.seconds) * 1000;
+    const days = duration.weeks * 7 + duration.days;
+    // Days and weeks are calendar days: 1 day from noon ends at noon even across a clock change.
+    length = days ? { days, ms } : { exact: ms };
+  }
+  return { allDay: false, dtstart, zoner, start, length };
+}
+
+function singleFrom(comp: ICALComponent, id: string): Single | null {
+  const t = readTiming(comp);
+  if (!t) return null;
+  const end = t.allDay ? t.start + (t.length as number) : endOf(wall(t.dtstart), t.start, t.zoner, t.length as Length);
+  return { id, ...info(comp), allDay: t.allDay, start: t.start, end };
+}
+
+/** The key of a RECURRENCE-ID / EXDATE / RDATE time, read like the series start. */
+function keyOf(v: ICALTime, tzid: string | null, series: { allDay: boolean; tzid: string | null; dtstart: ICALTime; zoner: Zoner }): number {
+  if (series.allDay) {
+    if (v.isDate) return dateDay(v);
+    return dayNumberOfInstant(zonerFor(v, tzid).toInstant(wall(v)));
+  }
+  if (v.isDate) {
+    // A plain date for a timed series: that date at the series' clock time.
+    return series.zoner.toInstant({ ...wall(series.dtstart), year: v.year, month: v.month, day: v.day });
+  }
+  return zonerFor(v, tzid ?? series.tzid).toInstant(wall(v));
+}
+
+/**
+ * Reads a calendar whose full parse failed by parsing each event on its own
+ * (with the file's time zone definitions), keeping the ones that parse.
+ */
+function parseLeniently(t: string): { parsed: unknown; dropped: number } | null {
+  if (!/BEGIN:VCALENDAR/i.test(t)) return null;
+  const zones = t.match(/^BEGIN:VTIMEZONE\r?\n[\s\S]*?^END:VTIMEZONE\r?$/gim) ?? [];
+  const events = t.match(/^BEGIN:VEVENT\r?\n[\s\S]*?^END:VEVENT\r?$/gim) ?? [];
+  const wrap = (parts: string[]) => ["BEGIN:VCALENDAR", "VERSION:2.0", ...parts, "END:VCALENDAR"].join("\r\n");
+  const goodZones = zones.filter((z) => {
+    try {
+      ICAL.parse(wrap([z]));
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  const good: string[] = [];
+  let dropped = 0;
+  for (const e of events) {
+    try {
+      ICAL.parse(wrap([e]));
+      good.push(e);
+    } catch {
+      dropped++;
+    }
+  }
+  try {
+    return { parsed: ICAL.parse(wrap([...goodZones, ...good])), dropped };
+  } catch {
+    return null;
+  }
 }
 
 function lowerBound(arr: number[], x: number): number {
@@ -197,49 +358,72 @@ export class Calendar {
     this.jumpAhead = options.jumpAhead ?? true;
     const singles: Single[] = [];
     let calendars = 0;
+    let unreadable = 0;
     let n = 0;
     for (const t of texts) {
       let parsed: unknown;
       try {
         parsed = ICAL.parse(t);
       } catch {
-        throw new CalendarError("This file couldn't be read as a calendar. Check it's an .ics file exported from your calendar.");
+        // One bad line shouldn't lose the whole calendar: read event by event.
+        const lenient = parseLeniently(t);
+        if (!lenient) throw new CalendarError("This file couldn't be read as a calendar. Check it's an .ics file exported from your calendar.");
+        parsed = lenient.parsed;
+        unreadable += lenient.dropped;
       }
       const roots = (Array.isArray(parsed) && typeof parsed[0] === "string" ? [parsed] : (parsed as unknown[])) as unknown[];
       for (const root of roots) {
-        const vcal = new ICAL.Component(root as never);
+        let vcal: ICALComponent;
+        try {
+          vcal = new ICAL.Component(root as never);
+        } catch {
+          continue;
+        }
         if (vcal.name !== "vcalendar") continue;
         calendars++;
-        const vevents = vcal.getAllSubcomponents("vevent");
-        // Overrides of one occurrence of a series, grouped by series UID.
+        // Overrides of occurrences of a series, grouped by series UID.
         const overrides = new Map<string, ICALComponent[]>();
         const masters: ICALComponent[] = [];
-        for (const ev of vevents) {
-          if (ev.hasProperty("recurrence-id")) {
-            const uid = text(ev, "uid");
-            const list = overrides.get(uid) ?? [];
-            list.push(ev);
-            overrides.set(uid, list);
-          } else if (ev.hasProperty("rrule") || ev.hasProperty("rdate")) {
-            masters.push(ev);
-          } else if (!isCancelled(ev)) {
-            const s = readSingle(ev, `e${n++}`);
-            if (s) singles.push(s);
+        for (const ev of vcal.getAllSubcomponents("vevent")) {
+          try {
+            if (ev.hasProperty("recurrence-id")) {
+              const uid = text(ev, "uid");
+              const list = overrides.get(uid) ?? [];
+              list.push(ev);
+              overrides.set(uid, list);
+            } else if (ev.hasProperty("rrule") || ev.hasProperty("rdate")) {
+              masters.push(ev);
+            } else if (!isCancelled(ev)) {
+              const s = singleFrom(ev, `e${n++}`);
+              if (s) singles.push(s);
+              else unreadable++;
+            }
+          } catch {
+            unreadable++;
           }
         }
         for (const m of masters) {
-          const uid = text(m, "uid");
           if (isCancelled(m)) continue;
-          const s = this.readSeries(m, `s${n++}`, overrides.get(uid) ?? []);
-          if (s) this.series.push(s);
+          try {
+            const s = this.readSeries(m, `s${n++}`, overrides.get(text(m, "uid")) ?? []);
+            if (s && !s.failed) this.series.push(s);
+            else unreadable++;
+          } catch {
+            unreadable++;
+          }
         }
         // Overrides become ordinary events at their own (possibly moved) time.
         // Orphan overrides (no series in the file) are kept too.
         for (const [, list] of overrides) {
           for (const ov of list) {
             if (isCancelled(ov)) continue;
-            const s = readSingle(ov, `e${n++}`);
-            if (s) singles.push(s);
+            try {
+              const s = singleFrom(ov, `e${n++}`);
+              if (s) singles.push(s);
+              else unreadable++;
+            } catch {
+              unreadable++;
+            }
           }
         }
       }
@@ -262,93 +446,162 @@ export class Calendar {
     this.allDayStarts = this.allDaySingles.map((s) => s.start);
     this.maxAllDayLength = this.allDaySingles.reduce((m, s) => Math.max(m, s.end - s.start), 0);
 
-    let firstDay: number | null = null;
-    let lastDay: number | null = null;
-    const note = (d: number) => {
-      if (firstDay === null || d < firstDay) firstDay = d;
-      if (lastDay === null || d > lastDay) lastDay = d;
-    };
-    for (const s of singles) note(s.allDay ? s.start : dayNumberOfInstant(s.start));
-    for (const s of this.series) note(s.allDay ? dateDay(s.dtstart) : dayNumberOfInstant(instant(s.dtstart, s.zone)));
-    this.summary = {
-      events: singles.length + this.series.length,
-      recurring: this.series.length,
-      calendars,
-      firstDay,
-      lastDay,
-    };
+    this.summary = { events: singles.length + this.series.length, recurring: this.series.length, calendars, unreadable };
   }
 
   private readSeries(comp: ICALComponent, id: string, overrides: ICALComponent[]): Series | null {
-    const base = readSingle(comp, id);
-    if (!base) return null;
-    const dtstart = comp.getFirstPropertyValue("dtstart") as ICALTime;
-    const zone = tzidOf(comp, "dtstart");
+    const timing = readTiming(comp);
+    if (!timing) return null;
+    const { allDay, zoner, length } = timing;
+    const tzid = param(comp, "dtstart", "tzid");
+    const d0 = timing.dtstart;
+    // Repeat rules run on plain clock times; this layer applies the zone.
+    const dtstart = ICAL.Time.fromData({ year: d0.year, month: d0.month, day: d0.day, hour: d0.hour, minute: d0.minute, second: d0.second, isDate: d0.isDate });
+    const ctx = { allDay, tzid, dtstart, zoner };
+
     const skip = new Set<number>();
+    const skipDays = new Set<number>();
+    const future: FutureChange[] = [];
     for (const ov of overrides) {
-      const rid = ov.getFirstPropertyValue("recurrence-id") as ICALTime | null;
-      if (rid && typeof rid === "object" && "year" in rid) {
-        skip.add(occurrenceKey(rid, tzidOf(ov, "recurrence-id"), base.allDay));
+      const rid = ov.getFirstPropertyValue("recurrence-id");
+      if (!isTime(rid)) continue;
+      const ridKey = keyOf(rid, param(ov, "recurrence-id", "tzid"), ctx);
+      skip.add(ridKey);
+      if ((param(ov, "recurrence-id", "range") ?? "").toUpperCase() === "THISANDFUTURE") {
+        const s = singleFrom(ov, "");
+        if (!s && !isCancelled(ov)) continue;
+        future.push({
+          fromKey: ridKey,
+          shift: s ? s.start - ridKey : 0,
+          length: s ? s.end - s.start : 0,
+          cancelled: isCancelled(ov),
+          title: s?.title ?? "",
+          location: s?.location ?? "",
+        });
       }
     }
-    // EXDATEs, compared as instants so a UTC EXDATE still matches a zoned series.
+    future.sort((a, b) => a.fromKey - b.fromKey);
+
     for (const p of comp.getAllProperties("exdate")) {
       const pz = p.getParameter("tzid");
-      for (const v of p.getValues() as ICALTime[]) {
-        if (v && typeof v === "object" && "year" in v) {
-          skip.add(occurrenceKey(v, typeof pz === "string" ? pz : zone, base.allDay));
+      for (const v of p.getValues()) {
+        if (!isTime(v)) continue;
+        if (v.isDate && !allDay) skipDays.add(dateDay(v));
+        else skip.add(keyOf(v, typeof pz === "string" ? pz : null, ctx));
+      }
+    }
+
+    const occurrenceOf = (w: Wall, key: number): Occurrence => ({
+      key,
+      end: allDay ? key + (length as number) : endOf(w, key, zoner, length as Length),
+    });
+
+    // The start itself and every RDATE (each in its own zone; PERIODs carry their own end).
+    const extra: Occurrence[] = [occurrenceOf(wall(dtstart), timing.start)];
+    for (const p of comp.getAllProperties("rdate")) {
+      const pz = p.getParameter("tzid");
+      const pzone = typeof pz === "string" ? pz : null;
+      for (const v of p.getValues()) {
+        if (isTime(v)) {
+          const key = keyOf(v, pzone, ctx);
+          const w = v.isDate && !allDay ? { ...wall(dtstart), year: v.year, month: v.month, day: v.day } : wall(v);
+          extra.push(allDay ? { key, end: key + (length as number) } : { key, end: v.isDate ? endOf(w, key, zoner, length as Length) : endOf(w, key, zonerFor(v, pzone ?? tzid), length as Length) });
+          if (!allDay && v.isDate && skipDays.has(dateDay(v))) skip.add(key);
+        } else if (v && typeof v === "object" && "start" in v) {
+          const period = v as InstanceType<typeof ICAL.Period>;
+          const startT = period.start;
+          if (!isTime(startT)) continue;
+          const key = keyOf(startT, pzone, ctx);
+          const endT = period.getEnd();
+          const end = allDay ? Math.max(key + 1, dateDay(endT)) : Math.max(key, zonerFor(endT, pzone ?? tzid).toInstant(wall(endT)));
+          extra.push({ key, end });
         }
       }
     }
-    // A series can jump ahead (start from a later occurrence) when the rule is
-    // a plain repeating pattern: no COUNT (which needs every earlier occurrence),
-    // no extra dates, and a start day that exists in every month.
+    if (!allDay) for (const o of extra) if (skipDays.has(dayNumberOfInstant(o.key))) skip.add(o.key);
+    extra.sort((a, b) => a.key - b.key);
+
+    const rules: Series["rules"] = [];
+    for (const p of comp.getAllProperties("rrule")) {
+      const recur = p.getFirstValue() as ICALRecur;
+      if (!recur || typeof recur !== "object" || !("freq" in recur)) return null;
+      let untilKey: number | null = null;
+      let untilDay: number | null = null;
+      const until = recur.until as ICALTime | null | undefined;
+      if (isTime(until)) {
+        if (until.isDate) untilDay = dateDay(until);
+        else if (allDay) untilDay = dayNumberOfInstant(zonerFor(until, null).toInstant(wall(until)));
+        // UNTIL in UTC is exact; a UNTIL without "Z" is read in the series' zone.
+        else untilKey = zonerFor(until, tzid).toInstant(wall(until));
+      }
+      const stripped = recur.clone();
+      stripped.count = null as unknown as number;
+      stripped.until = null as unknown as ICALTime;
+      rules.push({ recur: stripped, count: recur.count ? Number(recur.count) : null, untilKey, untilDay });
+    }
+
+    // A series can jump ahead (start from a later occurrence) when it has one
+    // plain repeating rule: no COUNT (which needs every earlier occurrence) and
+    // a start day that exists in every month.
     let jump: Series["jump"] = null;
-    const rrules = comp.getAllProperties("rrule");
-    if (this.jumpAhead && rrules.length === 1 && !comp.hasProperty("rdate")) {
-      const rule = rrules[0].getFirstValue() as InstanceType<typeof ICAL.Recur>;
-      const freq = rule?.freq;
-      const interval = Math.max(1, Number(rule?.interval) || 1);
-      const dayOk = dtstart.day <= 28;
-      if (rule && !rule.count && (freq === "DAILY" || freq === "WEEKLY" || ((freq === "MONTHLY" || freq === "YEARLY") && dayOk))) {
+    if (this.jumpAhead && rules.length === 1 && rules[0].count === null) {
+      const freq = rules[0].recur.freq;
+      const interval = Math.max(1, Number(rules[0].recur.interval) || 1);
+      if (freq === "DAILY" || freq === "WEEKLY" || ((freq === "MONTHLY" || freq === "YEARLY") && dtstart.day <= 28)) {
         jump = { freq, interval };
       }
     }
+
+    let maxLength: number;
+    if (allDay) maxLength = length as number;
+    else if ("exact" in (length as Length)) maxLength = (length as { exact: number }).exact;
+    else maxLength = (length as { days: number; ms: number }).days * DAY_MS + (length as { ms: number }).ms + 3600000;
+    for (const o of extra) maxLength = Math.max(maxLength, o.end - o.key);
+
     const series: Series = {
       id,
-      title: base.title,
-      location: base.location,
-      allDay: base.allDay,
-      component: comp,
+      ...info(comp),
+      allDay,
       dtstart,
-      zone,
-      length: base.end - base.start,
+      zoner,
+      length,
+      maxLength,
+      rules,
+      extra,
       skip,
+      skipDays,
+      future,
+      shiftMin: Math.min(0, ...future.map((f) => f.shift)),
+      shiftMax: Math.max(0, ...future.map((f) => f.shift + Math.max(0, f.length))),
       jump,
-      expansion: null,
+      states: [],
       windowStart: -Infinity,
       starts: [],
-      done: false,
+      ends: [],
+      done: rules.length === 0,
+      failed: false,
     };
-    this.restart(series, -Infinity);
+    // Starting the rules also checks they can be followed at all, so a rule
+    // the app can't handle is reported on import rather than silently empty.
+    if (rules.length) this.restart(series, -Infinity);
     return series;
   }
 
   /**
-   * (Re)starts expanding a series so that every occurrence from `from` on will
-   * be found: from the series' own start, or, when the rule allows, from a
-   * whole number of repeats later (so the pattern lines up exactly).
+   * (Re)starts expanding a series' rules so that every occurrence from `from`
+   * on will be found: from the series' own start, or, when the rule allows,
+   * from a whole number of repeats later (so the pattern lines up exactly).
    */
   private restart(s: Series, from: number): void {
     let anchor = s.dtstart;
     let windowStart = -Infinity;
+    let moved = false;
     if (s.jump && Number.isFinite(from)) {
       // A couple of days' margin covers the gap between the series' time zone and ours.
       const fromDay = (s.allDay ? from : dayNumberOfInstant(from)) - 2;
       const startDay = dateDay(s.dtstart);
       const { freq, interval } = s.jump;
       const t = s.dtstart.clone();
-      let moved = false;
       if (freq === "DAILY" || freq === "WEEKLY") {
         const period = freq === "DAILY" ? interval : interval * 7;
         const k = Math.floor((fromDay - startDay) / period);
@@ -377,48 +630,102 @@ export class Calendar {
       }
       if (moved) {
         anchor = t;
-        // The new anchor itself might not match the rule (the expansion always
+        // The new anchor itself might not match the rule (an iterator always
         // returns its start), so only trust what comes after it.
-        windowStart = occurrenceKey(anchor, s.zone, s.allDay) + 1;
+        windowStart = (s.allDay ? dateDay(anchor) : s.zoner.toInstant(wall(anchor))) + 1;
       }
     }
+    s.states = [];
+    s.done = false;
     try {
-      s.expansion = new ICAL.RecurExpansion({ component: s.component, dtstart: anchor });
-      s.done = false;
+      for (const r of s.rules) {
+        const st: RuleState = { it: r.recur.iterator(anchor.clone()), count: r.count, n: 0, untilKey: r.untilKey, untilDay: r.untilDay, first: !moved, peek: null };
+        this.advance(s, st);
+        s.states.push(st);
+      }
     } catch {
-      s.expansion = null;
+      s.failed = true;
       s.done = true;
     }
     s.windowStart = windowStart;
     s.starts = [];
+    s.ends = [];
   }
 
-  /** Makes sure every occurrence starting in [from, to) is known. */
+  /** Moves a rule to its next real occurrence (skipping clock times that don't exist, which don't count). */
+  private advance(s: Series, st: RuleState): void {
+    st.peek = null;
+    for (let guard = 0; guard < 10_000; guard++) {
+      const t = st.it.next();
+      if (!t) return;
+      const w = wall(t);
+      const explicit = st.first;
+      st.first = false;
+      if (!s.allDay && !explicit && !s.zoner.exists(w)) continue;
+      const day = dateDay(t);
+      const key = s.allDay ? day : s.zoner.toInstant(w);
+      if (st.untilKey !== null && key > st.untilKey) return;
+      if (st.untilDay !== null && day > st.untilDay) return;
+      st.n++;
+      if (st.count !== null && st.n > st.count) return;
+      st.peek = { key, day, end: s.allDay ? key + (s.length as number) : endOf(w, key, s.zoner, s.length as Length) };
+      return;
+    }
+  }
+
+  /** Makes sure every rule occurrence starting in [from, to) is known. */
   private ensure(s: Series, from: number, to: number): void {
-    const far = s.allDay ? FAR_DAYS : FAR_DAYS * 86400000;
+    if (s.failed) return;
+    const far = s.allDay ? FAR_DAYS : FAR_DAYS * DAY_MS;
     const known = s.starts.length ? s.starts[s.starts.length - 1] : s.windowStart;
     if (from < s.windowStart || (s.jump && !s.done && known < from - far)) this.restart(s, from);
-    while (!s.done) {
-      const last = s.starts.length ? s.starts[s.starts.length - 1] : -Infinity;
-      if (last >= to) return;
-      let next: ICALTime | null = null;
-      try {
-        next = s.expansion!.next() ?? null;
-      } catch {
-        next = null;
+    try {
+      while (!s.done) {
+        const last = s.starts.length ? s.starts[s.starts.length - 1] : -Infinity;
+        if (last >= to) return;
+        let best: RuleState | null = null;
+        for (const st of s.states) if (st.peek && (!best || st.peek.key < best.peek!.key)) best = st;
+        if (!best || s.starts.length >= MAX_OCCURRENCES) {
+          s.done = true;
+          return;
+        }
+        const occ = best.peek!;
+        this.advance(s, best);
+        if (occ.key < s.windowStart || occ.key <= last) continue;
+        // Skipped occurrences are recorded too (and filtered when read), so the
+        // expansion always knows how far it has got.
+        if (!s.allDay && s.skipDays.has(occ.day)) s.skip.add(occ.key);
+        s.starts.push(occ.key);
+        s.ends.push(occ.end);
       }
-      if (!next || s.starts.length >= MAX_OCCURRENCES) {
-        s.done = true;
-        s.expansion = null;
-        return;
-      }
-      const key = occurrenceKey(next, s.zone, s.allDay);
-      if (key < s.windowStart) continue;
-      // Skipped occurrences are recorded too (and filtered when read), so the
-      // expansion always knows how far it has got.
-      if (s.starts.length && key < s.starts[s.starts.length - 1]) continue;
-      s.starts.push(key);
+    } catch {
+      s.failed = true;
+      s.done = true;
     }
+  }
+
+  /** Occurrences of a series starting in [from, to), after exclusions and "this and future" changes. */
+  private occurrences(s: Series, from: number, to: number): (Occurrence & EventInfo)[] {
+    const lo = from - s.shiftMax;
+    const hi = to - s.shiftMin;
+    const found = new Map<number, number>();
+    if (s.rules.length) {
+      this.ensure(s, lo, hi);
+      for (let i = lowerBound(s.starts, lo); i < s.starts.length && s.starts[i] < hi; i++) found.set(s.starts[i], s.ends[i]);
+    }
+    for (const o of s.extra) if (o.key >= lo && o.key < hi && !found.has(o.key)) found.set(o.key, o.end);
+    const out: (Occurrence & EventInfo)[] = [];
+    for (const [key, end] of found) {
+      if (s.skip.has(key)) continue;
+      let change: FutureChange | null = null;
+      for (const f of s.future) if (f.fromKey < key) change = f;
+      if (change?.cancelled) continue;
+      const start = key + (change?.shift ?? 0);
+      const e = change ? start + change.length : end;
+      if (start < from || start >= to) continue;
+      out.push({ key: start, end: e, title: change?.title ?? s.title, location: change?.location ?? s.location });
+    }
+    return out;
   }
 
   /** Everything on one local day (a day number), in the device's time zone. */
@@ -426,6 +733,7 @@ export class Calendar {
     const { start: dayStart, end: dayEnd } = dayRange(dayNum);
     const allDay: AllDayItem[] = [];
     const timed: DayEvent[] = [];
+    let failedSeries = 0;
 
     const addTimed = (id: string, ev: EventInfo, start: number, end: number) => {
       const overlaps = start < dayEnd && (end > dayStart || (end === start && start >= dayStart));
@@ -455,32 +763,16 @@ export class Calendar {
     for (const s of this.longAllDay) addAllDay(s.id, s, s.start, s.end);
 
     for (const s of this.series) {
-      if (s.allDay) {
-        this.ensure(s, dayNum - s.length + 1, dayNum + 1);
-        for (let i = lowerBound(s.starts, dayNum - s.length + 1); i < s.starts.length; i++) {
-          const st = s.starts[i];
-          if (st > dayNum) break;
-          if (s.skip.has(st)) continue;
-          addAllDay(`${s.id}-${st}`, s, st, st + Math.max(1, s.length));
-        }
-      } else {
-        this.ensure(s, dayStart - s.length, dayEnd);
-        for (let i = lowerBound(s.starts, dayStart - s.length); i < s.starts.length; i++) {
-          const st = s.starts[i];
-          if (st >= dayEnd) break;
-          if (s.skip.has(st)) continue;
-          addTimed(`${s.id}-${st}`, s, st, st + s.length);
-        }
+      const occ = s.allDay ? this.occurrences(s, dayNum - s.maxLength + 1, dayNum + 1) : this.occurrences(s, dayStart - s.maxLength, dayEnd);
+      if (s.failed) failedSeries++;
+      for (const o of occ) {
+        if (s.allDay) addAllDay(`${s.id}-${o.key}`, o, o.key, Math.max(o.key + 1, o.end));
+        else addTimed(`${s.id}-${o.key}`, o, o.key, o.end);
       }
     }
 
     timed.sort((a, b) => a.start - b.start || b.end - a.end || a.title.localeCompare(b.title));
     allDay.sort((a, b) => a.firstDay - b.firstDay || a.title.localeCompare(b.title));
-    return { day: dayNum, allDay, timed };
+    return { day: dayNum, allDay, timed, failedSeries };
   }
-}
-
-function dayNumberOfInstant(ms: number): number {
-  const d = new Date(ms);
-  return dayNumber(d.getFullYear(), d.getMonth() + 1, d.getDate());
 }

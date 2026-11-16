@@ -39,6 +39,17 @@ async function run<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRe
   }
 }
 
+/**
+ * Saves and removals run one at a time, in the order they were asked for, so
+ * a removal asked for while a save is still running always happens after it.
+ */
+let queue: Promise<unknown> = Promise.resolve();
+function inTurn<T>(fn: () => Promise<T>): Promise<T> {
+  const next = queue.then(fn, fn);
+  queue = next.catch(() => undefined);
+  return next;
+}
+
 export async function loadSaved(): Promise<SavedCalendar | null> {
   try {
     const v = await run<SavedCalendar | undefined>("readonly", (s) => s.get(KEY));
@@ -49,22 +60,26 @@ export async function loadSaved(): Promise<SavedCalendar | null> {
 }
 
 /** Returns false if the browser wouldn't keep it. */
-export async function save(cal: SavedCalendar): Promise<boolean> {
-  try {
-    await run("readwrite", (s) => s.put(cal, KEY));
-    return true;
-  } catch {
-    return false;
-  }
+export function save(cal: SavedCalendar): Promise<boolean> {
+  return inTurn(async () => {
+    try {
+      await run("readwrite", (s) => s.put(cal, KEY));
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
-export async function removeSaved(): Promise<boolean> {
-  try {
-    await run("readwrite", (s) => s.delete(KEY));
-    return true;
-  } catch {
-    return false;
-  }
+export function removeSaved(): Promise<boolean> {
+  return inTurn(async () => {
+    try {
+      await run("readwrite", (s) => s.delete(KEY));
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 const SETTINGS = "squeezed-day:threshold";

@@ -155,3 +155,36 @@ export function dayRange(dayNum: number): { start: number; end: number } {
     end: new Date(b.year, b.month - 1, b.day).getTime(),
   };
 }
+
+/** The wall clock reading of an instant in a zone. */
+export function wallOfInstant(ms: number, zone: string): Wall {
+  const f = formatterFor(zone)!;
+  const parts: Record<string, number> = {};
+  for (const p of f.formatToParts(new Date(ms))) {
+    if (p.type !== "literal") parts[p.type] = Number(p.value);
+  }
+  return { year: parts.year, month: parts.month, day: parts.day, hour: parts.hour % 24, minute: parts.minute, second: parts.second };
+}
+
+const sameWall = (a: Wall, b: Wall) =>
+  a.year === b.year && a.month === b.month && a.day === b.day && a.hour === b.hour && a.minute === b.minute && a.second === b.second;
+
+/**
+ * Whether a clock time really happens in a zone (null = the device's own zone).
+ * Times in the hour skipped when clocks go forward don't.
+ */
+export function wallExists(w: Wall, zone: string | null): boolean {
+  if (zone === null) {
+    const d = new Date(w.year, w.month - 1, w.day, w.hour, w.minute, w.second);
+    return sameWall(w, { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate(), hour: d.getHours(), minute: d.getMinutes(), second: d.getSeconds() });
+  }
+  const t = wallToInstant(w, zone);
+  const d = new Date(t + offsetAt(zone, t));
+  return sameWall(w, { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), hour: d.getUTCHours(), minute: d.getUTCMinutes(), second: d.getUTCSeconds() });
+}
+
+/** The same clock time a number of calendar days later. */
+export function addDaysToWall(w: Wall, days: number): Wall {
+  const d = new Date(Date.UTC(w.year, w.month - 1, w.day + days));
+  return { ...w, year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}

@@ -141,4 +141,28 @@ describe("layoutDay", () => {
     expect(positionOf(l, 570)).toBe(60);
     expect(positionOf(l, 615)).toBe(105);
   });
+
+  it("a timed event covering the whole day blocks the time: never 'Free all day' (review #3)", () => {
+    const l = layoutDay([], { ...opts, covered: [{ start: -60, end: 1500, title: "Conference" }] });
+    expect(l.blocks).toEqual([{ kind: "squeezed", start: 0, end: 1440, top: 0, height: 30, label: "All day · Conference", covered: "Conference" }]);
+  });
+
+  it("covered time around a shorter appointment isn't called free (review #3)", () => {
+    const l = layoutDay([ev("call", 600, 630)], { ...opts, covered: [{ start: 0, end: 1440, title: "Trip" }] });
+    const strips = free(l.blocks);
+    expect(strips.map((b) => (b.kind === "squeezed" ? b.label : "gap"))).toEqual(["10 h · Trip", "13 h 30 · Trip"]);
+    expect(strips.every((b) => b.covered === "Trip")).toBe(true);
+    expect(l.blocks.some((b) => b.kind === "squeezed" && b.label.includes("free"))).toBe(false);
+  });
+
+  it("free time next to covered time stays free and separate", () => {
+    const l = layoutDay([], { ...opts, covered: [{ start: 0, end: 600, title: "Flight" }] });
+    expect(free(l.blocks).map((b) => (b.kind === "squeezed" ? b.label : ""))).toEqual(["10 h · Flight", "14 h free"]);
+  });
+
+  it("side-by-side appointments get their own, taller minimum (review #9)", () => {
+    const l = layoutDay([ev("a", 660, 720), ev("b", 690, 750), ev("c", 705, 780), ev("solo", 900, 905)], { ...opts, minSideHeight: 80 });
+    for (const e of events(l.blocks)) expect(e.height).toBeGreaterThanOrEqual(e.columns > 1 ? 80 : 40);
+    expectNoOverlap(l.blocks);
+  });
 });

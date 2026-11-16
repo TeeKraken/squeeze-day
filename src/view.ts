@@ -3,7 +3,7 @@
  * calendar goes in as text, never as HTML.
  */
 import type { AllDayItem, DayEvent, DayEvents } from "./logic/calendar";
-import { freeLabel, layoutDay, positionOf, type Block } from "./logic/layout";
+import { freeLabel, layoutDay, lengthLabel, positionOf, type Block } from "./logic/layout";
 import { dayNumberToDate, dayRange } from "./logic/time";
 
 type Child = Node | string | null | false | undefined;
@@ -48,12 +48,18 @@ export function formatShortDay(dayNum: number): string {
   return shortDayFmt.format(dayDate(dayNum));
 }
 
-/** "9:20 – 10:00 AM", with a note when it started before or runs past this day. */
-export function timeRange(ev: { start: number; end: number }, dayStart: number, dayEnd: number): string {
+/** Start and end text, with the day added when it started before or runs past this day. */
+export function timeParts(ev: { start: number; end: number }, dayStart: number, dayEnd: number): { from: string; to: string | null } {
   const from = ev.start < dayStart ? `From ${shortDayFmt.format(ev.start)}, ${formatTime(ev.start)}` : formatTime(ev.start);
-  if (ev.end <= ev.start) return from;
+  if (ev.end <= ev.start) return { from, to: null };
   const to = ev.end > dayEnd ? `${shortDayFmt.format(ev.end)}, ${formatTime(ev.end)}` : formatTime(ev.end);
-  return `${from} – ${to}`;
+  return { from, to };
+}
+
+/** "9:20 AM – 10:00 AM", with the day added when it started before or runs past this day. */
+export function timeRange(ev: { start: number; end: number }, dayStart: number, dayEnd: number): string {
+  const { from, to } = timeParts(ev, dayStart, dayEnd);
+  return to ? `${from} – ${to}` : from;
 }
 
 export interface DrawOptions {
@@ -68,6 +74,8 @@ export interface DrawOptions {
 export const SCALE = 1.2;
 /** Room an appointment needs for its time and one or two lines of title. */
 export const MIN_EVENT_HEIGHT = 58;
+/** Side-by-side appointments are narrow: start and end get a line each, plus two title lines. */
+export const MIN_SIDE_HEIGHT = 76;
 // Sizes (px) matching style.css: button padding, time line, title line.
 const EV_PAD = 8;
 const TIME_LINE = 15;
@@ -94,9 +102,12 @@ export function drawTimeline(ol: HTMLElement, day: DayEvents, opts: DrawOptions)
   const { start: dayStart, end: dayEnd } = dayRange(day.day);
   const dayMinutes = (dayEnd - dayStart) / 60000;
   const byId = new Map(day.timed.map((e) => [e.id, e]));
+  const min = (ms: number) => (ms - dayStart) / 60000;
+  // Timed events shown in the all-day row (a trip, a conference) still take up the time.
+  const covered = day.allDay.filter((a) => a.timed).map((a) => ({ start: min(a.timed!.start), end: min(a.timed!.end), title: a.title }));
   const layout = layoutDay(
-    day.timed.map((e) => ({ id: e.id, start: (e.start - dayStart) / 60000, end: (e.end - dayStart) / 60000 })),
-    { dayMinutes, threshold: opts.threshold, scale: SCALE, minEventHeight: MIN_EVENT_HEIGHT, expanded: opts.expanded },
+    day.timed.map((e) => ({ id: e.id, start: min(e.start), end: min(e.end) })),
+    { dayMinutes, threshold: opts.threshold, scale: SCALE, minEventHeight: MIN_EVENT_HEIGHT, minSideHeight: MIN_SIDE_HEIGHT, expanded: opts.expanded, covered },
   );
   ol.replaceChildren();
   ol.style.height = `${Math.ceil(layout.height)}px`;
@@ -134,20 +145,21 @@ function block(b: Block, byId: Map<string, DayEvent>, dayStart: number, dayEnd: 
       h("span", { class: "fold-times" }, `${formatTime(dayStart + b.start * 60000)} – ${formatTime(dayStart + b.end * 60000)}`),
     );
     btn.addEventListener("click", () => opts.onOpenGap(b.start));
-    const li = h("li", { class: "fold", "data-fold": String(b.start) }, btn);
+    const li = h("li", { class: b.covered ? "fold fold-covered" : "fold", "data-fold": String(b.start) }, btn);
     place(li, b);
     return li;
   }
   if (b.kind === "gap") {
-    const li = h("li", { class: b.expanded ? "gap gap-open" : "gap", "data-gap": String(b.start) });
+    const li = h("li", { class: `gap${b.expanded ? " gap-open" : ""}${b.covered ? " gap-covered" : ""}`, "data-gap": String(b.start) });
     place(li, b);
     const mins = b.end - b.start;
+    const what = b.covered ? `${lengthLabel(mins)} · ${b.covered}` : freeLabel(mins);
     if (b.expanded) {
-      const btn = h("button", { type: "button", class: "btn btn-small squeeze-btn", "aria-label": `${freeLabel(mins)}, ${minutesLabel(b.start, b.end, dayStart)}. Squeeze it again.` }, `${freeLabel(mins)} · Squeeze`);
+      const btn = h("button", { type: "button", class: "btn btn-small squeeze-btn", "aria-label": `${what}, ${minutesLabel(b.start, b.end, dayStart)}. Squeeze it again.` }, `${what} · Squeeze`);
       btn.addEventListener("click", () => opts.onCloseGap(b.start));
       li.append(btn);
     } else if (b.height >= 16 && mins >= 10) {
-      li.append(h("span", { class: "gap-label" }, freeLabel(mins)));
+      li.append(h("span", { class: "gap-label" }, what));
     } else {
       li.setAttribute("aria-hidden", "true");
     }
@@ -155,14 +167,18 @@ function block(b: Block, byId: Map<string, DayEvent>, dayStart: number, dayEnd: 
   }
   const ev = byId.get(b.id)!;
   const when = timeRange(ev, dayStart, dayEnd);
+  const side = b.columns > 1;
+  const { from, to } = timeParts(ev, dayStart, dayEnd);
+  // Narrow side-by-side blocks put the start and end on a line each, so the end time stays visible.
+  const timeLines = side && to ? [h("span", { class: "ev-time" }, from), h("span", { class: "ev-time" }, `to ${to}`)] : [h("span", { class: "ev-time" }, when, ev.location ? h("span", { class: "ev-where" }, ` · ${ev.location}`) : null)];
   const btn = h(
     "button",
     { type: "button", class: "ev-btn", "aria-label": `${when}: ${ev.title}${ev.location ? `, ${ev.location}` : ""}` },
-    h("span", { class: "ev-time", "aria-hidden": "true" }, when, ev.location ? h("span", { class: "ev-where" }, ` · ${ev.location}`) : null),
+    h("span", { class: "ev-times", "aria-hidden": "true" }, ...timeLines),
     h("span", { class: "ev-title", "aria-hidden": "true" }, ev.title),
   );
   // As many title lines as fit, so a title is never cut through the middle.
-  const lines = Math.max(1, Math.min(4, Math.floor((b.height - 1 - EV_PAD - TIME_LINE) / TITLE_LINE)));
+  const lines = Math.max(1, Math.min(4, Math.floor((b.height - 1 - EV_PAD - TIME_LINE * timeLines.length) / TITLE_LINE)));
   btn.style.setProperty("--lines", String(lines));
   btn.addEventListener("click", () => opts.onEvent(ev));
   const li = h("li", { class: b.columns > 1 ? "ev ev-side" : "ev" }, btn);

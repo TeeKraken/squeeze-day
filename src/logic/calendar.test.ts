@@ -299,7 +299,7 @@ describe("files", () => {
       ics(vevent(`UID:a\nSUMMARY:A\nDTSTART:20250101T090000\nDTEND:20250101T100000`)),
       ics(vevent(`UID:b\nSUMMARY:B\nDTSTART:20270101T090000\nDTEND:20270101T100000\nRRULE:FREQ=DAILY`)),
     ]);
-    expect(cal.summary).toMatchObject({ events: 2, recurring: 1, calendars: 2, firstDay: d(2025, 1, 1), lastDay: d(2027, 1, 1) });
+    expect(cal.summary).toEqual({ events: 2, recurring: 1, calendars: 2, unreadable: 0 });
   });
 
   it("handles a big calendar (years of events) quickly, expanding only what's viewed", () => {
