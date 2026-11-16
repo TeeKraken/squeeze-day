@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Squeezed Day: a calendar day view that folds away empty hours</title>
+    <meta name="description" content="See your day on your phone with every appointment readable and long empty stretches folded into thin labelled strips, so more of the day fits on one screen. Free, and your calendar never leaves your device." />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#eef0f3" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#14171d" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <main id="main" tabindex="-1">
+      <header class="top side">
+        <h1><span class="logo" aria-hidden="true"></span>Squeezed Day</h1>
+        <p class="lede" id="lede">A day view for your calendar that keeps every appointment readable and folds long empty stretches into thin strips, so more of your day fits on the screen.</p>
+      </header>
+
+      <section class="card start" id="start" aria-labelledby="start-title">
+        <h2 id="start-title" tabindex="-1">Add your calendar</h2>
+        <p>Choose a calendar file (it ends in <b>.ics</b>, or <b>.zip</b> if it came from Google Calendar). It's read on this device and never uploaded.</p>
+        <div class="row-buttons">
+          <label class="btn btn-go file-btn">
+            Choose calendar file
+            <input type="file" id="file" accept=".ics,.ical,.ifb,.icalendar,.zip,text/calendar,application/zip" multiple />
+          </label>
+          <button type="button" class="btn btn-quiet" id="sample-btn">Try a sample day</button>
+        </div>
+        <p class="status" id="load-status" aria-live="polite"></p>
+        <p class="error" id="load-error" role="alert"></p>
+
+        <details class="how" id="how">
+          <summary>Where do I get a calendar file?</summary>
+          <p>Most calendar apps can save a copy of your calendar as a file, but many only let you do it from their website on a computer, not from the phone app. Save it there, send it to your phone (for example by emailing it to yourself), then add it here.</p>
+          <p><b>It's a copy.</b> Changes you make in your calendar afterwards won't show up here. When you want them, save a fresh copy and add it again.</p>
+          <ul class="how-list">
+            <li><b>Google Calendar:</b> on a computer, open Google Calendar, click the gear, then <b>Settings</b>, <b>Import &amp; export</b>, and <b>Export</b>. You get a .zip file with all your calendars; add it here as it is. For just one calendar, open that calendar's <b>Settings and sharing</b> and choose <b>Export calendar</b>.</li>
+            <li><b>Apple Calendar on a Mac:</b> click the calendar in the list on the left, then choose <b>File</b>, <b>Export</b>, <b>Export</b>.</li>
+            <li><b>Outlook and other apps:</b> look for <b>Export</b> or <b>Save calendar</b> in the app's menus or settings, and pick the iCalendar (.ics) format if asked.</li>
+          </ul>
+          <p class="hint">This app only shows your calendar. It never adds, changes or deletes anything.</p>
+        </details>
+      </section>
+
+      <section class="dayview" id="dayview" hidden aria-label="Day view">
+        <p class="sample-note" id="sample-note" hidden>This is a made-up sample calendar. <button type="button" class="link-btn" id="sample-own">Add your own calendar</button></p>
+        <div class="daybar" id="daybar">
+          <button type="button" class="btn btn-icon" id="prev" aria-label="Previous day" title="Previous day"><span aria-hidden="true">‹</span></button>
+          <div class="daytitle">
+            <h2 id="day-title" tabindex="-1" aria-live="polite"></h2>
+            <p class="day-sub" id="day-sub"></p>
+          </div>
+          <button type="button" class="btn btn-icon" id="next" aria-label="Next day" title="Next day"><span aria-hidden="true">›</span></button>
+        </div>
+        <div class="daytools">
+          <button type="button" class="btn btn-small" id="today">Today</button>
+          <label class="goto"><span>Go to</span><input type="date" id="goto" /></label>
+        </div>
+
+        <div class="allday" id="allday" hidden>
+          <h3 class="visually-hidden">All day</h3>
+          <ul class="allday-list" id="allday-list"></ul>
+        </div>
+
+        <div class="timeline-wrap">
+          <ol class="timeline" id="timeline" aria-label="Appointments and free time"></ol>
+        </div>
+        <p class="day-empty" id="day-busy" hidden></p>
+
+      </section>
+
+      <section class="card settings" id="settings" hidden aria-labelledby="settings-title">
+        <h2 id="settings-title">Settings</h2>
+        <label class="field">
+          <span>Squeeze free time longer than</span>
+          <select id="threshold">
+            <option value="30">30 minutes</option>
+            <option value="60" selected>1 hour</option>
+            <option value="120">2 hours</option>
+            <option value="180">3 hours</option>
+            <option value="never">Never squeeze</option>
+          </select>
+        </label>
+        <p class="hint">Tap a squeezed strip to open it to full size.</p>
+        <div class="cal-info">
+          <p id="cal-info"></p>
+          <p class="hint" id="cal-keep"></p>
+          <div class="row-buttons">
+            <label class="btn btn-quiet file-btn">
+              Add a newer copy
+              <input type="file" id="file2" accept=".ics,.ical,.ifb,.icalendar,.zip,text/calendar,application/zip" multiple />
+            </label>
+            <button type="button" class="btn btn-danger" id="remove">Remove this calendar</button>
+          </div>
+          <p class="status" id="load-status2" aria-live="polite"></p>
+          <p class="error" id="load-error2" role="alert"></p>
+        </div>
+      </section>
+
+      <dialog class="details" id="details" aria-labelledby="details-title">
+        <h2 id="details-title"></h2>
+        <p id="details-when"></p>
+        <p id="details-where"></p>
+        <button type="button" class="btn btn-go" id="details-close">Close</button>
+      </dialog>
+
+      <footer class="foot side">
+        <p>Your calendar is read inside this browser and never uploaded. It stays on this device until you remove it. The app only shows your calendar; it never adds, changes or deletes anything. No account, cookies, analytics scripts or tracking: the host counts visits and we only look at the totals.</p>
+        <p>Made entirely by an AI (Claude, by Anthropic) as a house build of <a href="https://somebodybuildthis.dev">Somebody Build This</a>, from <a href="https://somebodybuildthis.dev/ideas/114-a-phone-calendar-day-view-that-squeezes-long-empty-stretches">this idea</a>. Ideas never lock: anyone can build this idea too. <a href="https://github.com/TeeKraken/squeeze-day">Open source</a>.</p>
+      </footer>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
