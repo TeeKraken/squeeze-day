@@ -142,7 +142,8 @@ function block(b: Block, byId: Map<string, DayEvent>, dayStart: number, dayEnd: 
       "button",
       { type: "button", class: "fold-btn", "aria-label": `${b.label}, ${times}. Open to full size.` },
       h("span", { class: "fold-label" }, b.label),
-      h("span", { class: "fold-times" }, `${formatTime(dayStart + b.start * 60000)} – ${formatTime(dayStart + b.end * 60000)}`),
+      // A strip covering the whole day doesn't need its times spelled out.
+      b.start === 0 && dayStart + b.end * 60000 >= dayEnd ? null : h("span", { class: "fold-times" }, `${formatTime(dayStart + b.start * 60000)} – ${formatTime(dayStart + b.end * 60000)}`),
     );
     btn.addEventListener("click", () => opts.onOpenGap(b.start));
     const li = h("li", { class: b.covered ? "fold fold-covered" : "fold", "data-fold": String(b.start) }, btn);

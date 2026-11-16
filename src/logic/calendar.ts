@@ -321,6 +321,9 @@ function parseLeniently(t: string): { parsed: unknown; dropped: number } | null 
       dropped++;
     }
   }
+  // Events cut off part-way (a truncated file) count as unreadable too.
+  dropped += Math.max(0, (t.match(/^BEGIN:VEVENT\r?$/gim) ?? []).length - events.length);
+  if (good.length === 0 && dropped > 0) return null;
   try {
     return { parsed: ICAL.parse(wrap([...goodZones, ...good])), dropped };
   } catch {

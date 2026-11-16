@@ -294,7 +294,8 @@ sampleBtn.addEventListener("click", async () => {
     const text = await res.text();
     if (!isCurrent(g)) return;
     await loadCalendar(g, [{ name: "sample-calendar.ics", text }], "sample", SAMPLE_DAY, false);
-  } catch {
+  } catch (err) {
+    console.error(err);
     if (isCurrent(g)) setStatus("", "The sample couldn't be loaded. Check your connection and try again.");
   }
 });

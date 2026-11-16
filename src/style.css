@@ -532,6 +532,8 @@ h2 {
 }
 .ev-title {
   flex: none;
+  overflow-wrap: break-word;
+  hyphens: auto;
   font-size: 0.92rem;
   font-weight: 650;
   line-height: 17px;

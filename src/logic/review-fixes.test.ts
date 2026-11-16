@@ -102,6 +102,19 @@ describe("#4 RDATE is a proper recurrence set", () => {
   });
 });
 
+describe("files with broken parts", () => {
+  it("a cut-off file keeps the events that are complete and counts the rest", () => {
+    const text = ics(vevent(`UID:a\nSUMMARY:Whole\nDTSTART:20261116T090000\nDURATION:PT1H`)).replace("END:VCALENDAR", "BEGIN:VEVENT\r\nUID:b\r\nDTSTART:2026");
+    const cal = new Calendar([text]);
+    expect(times(cal, 2026, 11, 16)).toEqual(["09:00-10:00 Whole"]);
+    expect(cal.summary.unreadable).toBe(1);
+  });
+
+  it("a file with nothing readable is an error, not an empty calendar", () => {
+    expect(() => new Calendar(["BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:garbage\r\n"])).toThrow();
+  });
+});
+
 describe("#5 RANGE=THISANDFUTURE", () => {
   it("moves this and every later occurrence", () => {
     const cal = new Calendar([fixture("future-override")]);
