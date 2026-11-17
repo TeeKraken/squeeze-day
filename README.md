@@ -60,7 +60,8 @@ pnpm build     # production build into dist/
 - `src/logic/time.ts`: time zone conversion with the browser's `Intl` data, and local day ranges (clock-change days are 23 or 25 hours).
 - `src/logic/layout.ts`: the squeezed day layout.
 - `src/logic/zip.ts`: opens Google's export zip with the browser's built-in `DecompressionStream`, no library.
-- `src/worker.ts`: holds the calendar off the main thread.
+- `src/worker.ts`: holds calendars off the main thread; a newly read calendar waits as a candidate until the page activates it.
+- `src/pipeline.ts`: loads and removals one at a time (read, parse, keep on this device, activate), so a late finisher can never undo a later choice or leave the page and the worker showing different calendars.
 - `src/store.ts`: keeps the calendar in IndexedDB (and the squeeze setting in localStorage), failing softly when storage is blocked.
 - `src/view.ts`, `src/main.ts`: the page. Text from calendars is always inserted as text, never as HTML.
 

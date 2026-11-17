@@ -4,6 +4,7 @@ import { dayNumber, dayRange, localDayNumber } from "./logic/time";
 import { isZip, readIcsFromZip, ZipError } from "./logic/zip";
 import type { WorkerRequest, WorkerResponse } from "./protocol";
 import { loadSaved, loadThreshold, removeSaved, save, saveThreshold } from "./store";
+import { LoadPipeline, type CalendarFile, type Kept } from "./pipeline";
 import { dayDate, drawAllDay, drawTimeline, formatDay, formatShortDay, timeRange, type DrawOptions } from "./view";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -56,19 +57,13 @@ const state = {
   summary: null as CalendarSummary | null,
   names: [] as string[],
   /** What happened when keeping the calendar on this device. */
-  kept: "yes" as "yes" | "no" | "old-copy-remains",
+  kept: "yes" as Kept,
+  /** Which load the shown calendar came from; day answers from any other are ignored. */
+  loadId: 0,
 };
 
-/**
- * Every load (file, sample, restoring on start-up) and every removal starts a
- * new generation. A load checks it's still current after each wait, so a
- * removal (or a newer load) always wins over one still in progress.
- */
-let generation = 0;
-const begin = () => ++generation;
-const isCurrent = (g: number) => g === generation;
-/** Saves still running (a removal must clear what they write). */
-let saving = 0;
+/** Whether a calendar is currently kept in this browser's storage. */
+let savedNow = false;
 
 // ---- the worker that holds the calendar ----
 
@@ -93,9 +88,9 @@ function ask(msg: Req): Promise<WorkerResponse> {
 
 class FileProblem extends Error {}
 
-async function readFiles(files: FileList): Promise<{ name: string; text: string }[]> {
-  const out: { name: string; text: string }[] = [];
-  for (const file of Array.from(files)) {
+async function readFiles(files: File[]): Promise<CalendarFile[]> {
+  const out: CalendarFile[] = [];
+  for (const file of files) {
     if (file.size > MAX_BYTES) throw new FileProblem(`"${file.name}" is too big to open here (over 100 MB).`);
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (isZip(bytes)) {
@@ -116,57 +111,72 @@ function setStatus(msg: string, err = ""): void {
   for (const el of [error1, error2]) el.textContent = err;
 }
 
-async function loadCalendar(g: number, files: { name: string; text: string }[], mode: Mode, day: number, keep: boolean): Promise<boolean> {
-  setStatus(mode === "sample" ? "Opening the sample…" : "Reading your calendar…");
-  const res = await ask({ type: "load", texts: files.map((f) => f.text) });
-  if (!isCurrent(g)) return false;
-  if (res.type !== "loaded") {
-    setStatus("", res.type === "error" ? res.message : "Something went wrong.");
-    return false;
-  }
-  const hadSaved = state.mode === "mine" && state.kept !== "no";
-  let kept: typeof state.kept = "yes";
-  if (keep) {
-    // Saving and removing take turns (see store.ts), so a removal started
-    // after this always runs after this save and wins.
-    saving++;
-    try {
-      if (!(await save({ files, savedAt: Date.now() }))) {
-        // Don't let an older saved copy quietly come back next time.
-        kept = (await removeSaved()) ? "no" : hadSaved ? "old-copy-remains" : "no";
-      }
-    } finally {
-      saving--;
-    }
-    if (!isCurrent(g)) return false;
-  }
+const pipeline = new LoadPipeline<CalendarSummary>({
+  async parse(loadId, files) {
+    const res = await ask({ type: "parse", loadId, texts: files.map((f) => f.text) });
+    if (res.type === "parsed") return { ok: true, summary: res.summary };
+    return { ok: false, message: res.type === "error" ? res.message : "Something went wrong." };
+  },
+  discard(loadId) {
+    void ask({ type: "discard", loadId });
+  },
+  async activate(loadId) {
+    const res = await ask({ type: "activate", loadId });
+    if (res.type !== "activated") throw new Error(res.type === "error" ? res.message : "activate failed");
+  },
+  save: (files) => save({ files, savedAt: Date.now() }),
+  removeSaved,
+});
+
+class NothingSaved extends Error {}
+
+/**
+ * Loads a calendar through the pipeline and, if it's still wanted when it's
+ * ready, shows it. Errors leave the current calendar as it was.
+ */
+async function runLoad(read: () => Promise<CalendarFile[]>, mode: Mode, day: () => number, keep: boolean): Promise<void> {
+  const g = pipeline.current;
   const wasStart = !start.hidden;
+  setStatus(mode === "sample" ? "Opening the sample…" : "Reading your calendar…");
+  let r;
+  try {
+    r = await pipeline.load(read, keep, () => savedNow);
+  } catch (err) {
+    if (g !== pipeline.current || err instanceof NothingSaved) return setStatus("");
+    setStatus(
+      "",
+      err instanceof FileProblem || err instanceof ZipError
+        ? err.message
+        : mode === "sample"
+          ? "The sample couldn't be loaded. Check your connection and try again."
+          : "That file couldn't be opened. Try choosing it again.",
+    );
+    return;
+  }
+  if (g !== pipeline.current || r.status === "cancelled") return;
+  if (r.status === "error") {
+    setStatus("", r.message);
+    return;
+  }
+  if (r.kept === "yes") savedNow = true;
+  else if (r.kept === "no") savedNow = false;
+  state.loadId = r.loadId;
   state.mode = mode;
-  state.summary = res.summary;
-  state.names = files.map((f) => f.name);
-  state.kept = kept;
+  state.summary = r.summary;
+  state.names = r.files.map((f) => f.name);
+  if (mode === "mine") state.kept = r.kept === "not-asked" ? "yes" : r.kept;
   setStatus("");
   showDayview();
-  await goTo(day);
+  await goTo(day());
   // The button that started this is now hidden: put focus somewhere useful.
-  if (wasStart && isCurrent(g)) dayTitle.focus();
-  return true;
+  if (wasStart && g === pipeline.current) dayTitle.focus();
 }
 
-async function onFiles(input: HTMLInputElement): Promise<void> {
-  const files = input.files;
-  if (!files || files.length === 0) return;
-  const g = begin();
-  setStatus("Reading your calendar…");
-  try {
-    const read = await readFiles(files);
-    if (!isCurrent(g)) return;
-    await loadCalendar(g, read, "mine", localDayNumber(new Date()), true);
-  } catch (err) {
-    if (isCurrent(g)) setStatus("", err instanceof FileProblem || err instanceof ZipError ? err.message : "That file couldn't be opened. Try choosing it again.");
-  } finally {
-    input.value = "";
-  }
+function onFiles(input: HTMLInputElement): void {
+  const files = input.files ? Array.from(input.files) : [];
+  input.value = "";
+  if (files.length === 0) return;
+  void runLoad(() => readFiles(files), "mine", () => localDayNumber(new Date()), true);
 }
 
 // ---- showing a day ----
@@ -208,6 +218,8 @@ async function goTo(day: number, focusTitle = false): Promise<void> {
   }
   const res = await ask({ type: "day", day });
   if (ticket !== dayTicket || state.mode === "none") return;
+  // Only ever draw days from the calendar this page is showing.
+  if (res.type === "day" && res.loadId !== state.loadId) return;
   if (res.type !== "day") {
     setStatus("", res.type === "error" ? res.message : "Something went wrong.");
     return;
@@ -282,28 +294,31 @@ dialog.addEventListener("click", (e) => {
 
 // ---- controls ----
 
-fileInput.addEventListener("change", () => void onFiles(fileInput));
-fileInput2.addEventListener("change", () => void onFiles(fileInput2));
+fileInput.addEventListener("change", () => onFiles(fileInput));
+fileInput2.addEventListener("change", () => onFiles(fileInput2));
 
-sampleBtn.addEventListener("click", async () => {
-  const g = begin();
-  setStatus("Opening the sample…");
-  try {
-    const res = await fetch("/sample-calendar.ics");
-    if (!res.ok) throw new Error(String(res.status));
-    const text = await res.text();
-    if (!isCurrent(g)) return;
-    await loadCalendar(g, [{ name: "sample-calendar.ics", text }], "sample", SAMPLE_DAY, false);
-  } catch (err) {
-    console.error(err);
-    if (isCurrent(g)) setStatus("", "The sample couldn't be loaded. Check your connection and try again.");
-  }
+sampleBtn.addEventListener("click", () => {
+  void runLoad(
+    async () => {
+      const res = await fetch("/sample-calendar.ics");
+      if (!res.ok) throw new Error(String(res.status));
+      return [{ name: "sample-calendar.ics", text: await res.text() }];
+    },
+    "sample",
+    () => SAMPLE_DAY,
+    false,
+  );
 });
 
-function backToStart(): void {
-  begin(); // anything still loading is now out of date
+/**
+ * Goes back to the start page. Loads still in progress are cancelled at once;
+ * `clearStorage` also clears the saved calendar (after any save under way).
+ */
+function backToStart(clearStorage: boolean): Promise<boolean | null> {
+  const removal = pipeline.remove(clearStorage);
   void ask({ type: "clear" });
   state.mode = "none";
+  state.loadId = 0;
   state.data = null;
   state.summary = null;
   dayview.hidden = true;
@@ -316,24 +331,22 @@ function backToStart(): void {
     /* not important */
   }
   $("start-title").focus();
+  return removal;
 }
 
 sampleOwn.addEventListener("click", () => {
-  backToStart();
+  void backToStart(false);
   fileInput.focus();
 });
 
 removeBtn.addEventListener("click", async () => {
   const wasMine = state.mode === "mine";
-  const savePending = saving > 0;
-  backToStart();
-  // The sample is never saved, so closing it leaves a saved calendar alone,
-  // unless a calendar was still being saved when the sample was closed.
-  if (!wasMine && !savePending) return;
-  const g = generation;
-  const ok = await removeSaved();
-  if (!isCurrent(g)) return;
-  if (wasMine) setStatus(ok ? "Your calendar was removed from this device." : "", ok ? "" : "The app couldn't clear its storage. Clear this site's data in your browser settings to be sure.");
+  const g = pipeline.current + 1;
+  const ok = await backToStart(wasMine);
+  if (ok === null) return;
+  if (ok) savedNow = false;
+  if (g !== pipeline.current || !wasMine) return;
+  setStatus(ok ? "Your calendar was removed from this device." : "", ok ? "" : "The app couldn't clear its storage. Clear this site's data in your browser settings to be sure.");
 });
 
 prevBtn.addEventListener("click", () => void goTo(state.day - 1));
@@ -396,8 +409,16 @@ function dayFromHash(): number | null {
     thresholdSelect.value = t;
     state.threshold = t === "never" ? Infinity : Number(t);
   }
-  const g = begin();
-  const saved = await loadSaved();
-  if (!isCurrent(g)) return;
-  if (saved && saved.files.length) await loadCalendar(g, saved.files, "mine", dayFromHash() ?? localDayNumber(new Date()), false);
+  // Restoring goes through the same pipeline, so a sample or file chosen meanwhile simply follows it.
+  await runLoad(
+    async () => {
+      const saved = await loadSaved();
+      if (!saved || !saved.files.length) throw new NothingSaved();
+      savedNow = true;
+      return saved.files;
+    },
+    "mine",
+    () => dayFromHash() ?? localDayNumber(new Date()),
+    false,
+  );
 })();
