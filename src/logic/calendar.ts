@@ -15,6 +15,10 @@
 import ICAL from "ical.js";
 import {
   addDaysToWall,
+  localWall,
+  sameWall,
+  utcWall,
+  wallOfInstant,
   dayNumber,
   dayNumberToDate,
   dayRange,
@@ -76,6 +80,8 @@ type Length = { exact: number } | { days: number; ms: number };
 /** Converts clock times in one zone to instants. */
 interface Zoner {
   toInstant(w: Wall): number;
+  /** The clock reading of an instant in this zone. */
+  wallOf(ms: number): Wall;
   /** Whether this clock time happens at all (false in the hour skipped when clocks go forward). */
   exists(w: Wall): boolean;
 }
@@ -91,13 +97,17 @@ interface Single extends EventInfo {
 interface Occurrence {
   key: number;
   end: number;
+  /** An RDATE PERIOD: its own end wins over the series length for that start. */
+  period?: boolean;
 }
 
 /** A RECURRENCE-ID;RANGE=THISANDFUTURE change: applies to every later occurrence. */
 interface FutureChange extends EventInfo {
   fromKey: number;
   shift: number;
-  length: number;
+  /** The changed length: Length for timed series (kept nominal for day/week DURATIONs), days for all-day ones. */
+  length: Length | number;
+  zoner: Zoner;
   cancelled: boolean;
 }
 
@@ -173,9 +183,10 @@ function param(comp: ICALComponent, prop: string, name: string): string | null {
 
 const UTC: Zoner = {
   toInstant: (w) => Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second),
+  wallOf: utcWall,
   exists: () => true,
 };
-const FLOATING: Zoner = { toInstant: floatingToInstant, exists: (w) => wallExists(w, null) };
+const FLOATING: Zoner = { toInstant: floatingToInstant, wallOf: localWall, exists: (w) => wallExists(w, null) };
 const ianaZoners = new Map<string, Zoner>();
 
 /**
@@ -192,18 +203,31 @@ function zonerFor(t: ICALTime, tzid: string | null): Zoner {
     if (resolved) {
       let z = ianaZoners.get(resolved);
       if (!z) {
-        z = { toInstant: (w) => wallToInstant(w, resolved), exists: (w) => wallExists(w, resolved) };
+        z = { toInstant: (w) => wallToInstant(w, resolved), wallOf: (ms) => wallOfInstant(ms, resolved), exists: (w) => wallExists(w, resolved) };
         ianaZoners.set(resolved, z);
       }
       return z;
     }
     const zone = t.zone as (typeof t.zone & { component?: unknown }) | undefined;
     if (zone && zoneId && zoneId !== "floating" && zone.component) {
-      // A zone only the file defines: let ical.js convert with that definition.
-      return {
-        toInstant: (w) => ICAL.Time.fromData({ ...w, isDate: false }, zone).toUnixTime() * 1000,
-        exists: () => true,
+      // A zone only the file defines (Outlook writes names like "Eastern Standard
+      // Time"). ical.js gives the offset in force at a clock time from that
+      // definition; turning instants back into clock times is done here, as
+      // ical.js gets that wrong around clock changes.
+      const tz = zone as unknown as { utcOffset(t: ICALTime): number };
+      const offsetAtWall = (w: Wall) => tz.utcOffset(ICAL.Time.fromData({ ...w, isDate: false }, zone)) * 1000;
+      const toInstant = (w: Wall) => Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - offsetAtWall(w);
+      const wallOf = (ms: number) => {
+        // Offsets in force within a day either side; keep those that read back consistently.
+        const offsets = new Set<number>();
+        for (const h of [-26, -13, 0, 13, 26]) offsets.add(offsetAtWall(utcWall(ms + h * 3600000)));
+        const fits = [...offsets].filter((o) => offsetAtWall(utcWall(ms + o)) === o);
+        // Two can fit only in the hour skipped when clocks go forward; the earlier (smaller) offset is the real one there.
+        const o = fits.length ? Math.min(...fits) : [...offsets][0];
+        return utcWall(ms + o);
       };
+      // A clock time exists if turning it into an instant and back gives it again.
+      return { toInstant, wallOf, exists: (w) => sameWall(wallOf(toInstant(w)), w) };
     }
   }
   return FLOATING;
@@ -229,6 +253,18 @@ function isCancelled(comp: ICALComponent): boolean {
 function durationOf(comp: ICALComponent): ICALDuration | null {
   const d = comp.getFirstPropertyValue("duration");
   return d && typeof d === "object" && "toSeconds" in d ? (d as ICALDuration) : null;
+}
+
+/** Days and weeks are calendar days (keep the clock time); hours, minutes and seconds are elapsed time. */
+function lengthOf(d: ICALDuration): Length {
+  const ms = (d.hours * 3600 + d.minutes * 60 + d.seconds) * 1000;
+  const days = d.weeks * 7 + d.days;
+  return days ? { days, ms } : { exact: ms };
+}
+
+/** Upper bound of a Length in ms (a calendar day can be 25 hours). */
+function longest(length: Length): number {
+  return "exact" in length ? length.exact : length.days * DAY_MS + length.ms + 3600000;
 }
 
 function endOf(w: Wall, key: number, zoner: Zoner, length: Length): number {
@@ -266,10 +302,8 @@ function readTiming(comp: ICALComponent): Timing | null {
     const end = dtend.isDate ? zoner.toInstant(wall(dtend)) : zonerFor(dtend, param(comp, "dtend", "tzid")).toInstant(wall(dtend));
     length = { exact: Math.max(0, end - start) };
   } else if (duration && !duration.isNegative) {
-    const ms = (duration.hours * 3600 + duration.minutes * 60 + duration.seconds) * 1000;
-    const days = duration.weeks * 7 + duration.days;
     // Days and weeks are calendar days: 1 day from noon ends at noon even across a clock change.
-    length = days ? { days, ms } : { exact: ms };
+    length = lengthOf(duration);
   }
   return { allDay: false, dtstart, zoner, start, length };
 }
@@ -449,6 +483,12 @@ export class Calendar {
     this.allDayStarts = this.allDaySingles.map((s) => s.start);
     this.maxAllDayLength = this.allDaySingles.reduce((m, s) => Math.max(m, s.end - s.start), 0);
 
+    // A file whose events all failed isn't an (empty) calendar: don't let it replace a working one.
+    if (singles.length + this.series.length === 0 && unreadable > 0) {
+      throw new CalendarError(
+        `None of the events in this file could be read (${unreadable === 1 ? "1 event" : `${unreadable} events`}), so it wasn't opened. Try exporting your calendar again.`,
+      );
+    }
     this.summary = { events: singles.length + this.series.length, recurring: this.series.length, calendars, unreadable };
   }
 
@@ -471,15 +511,17 @@ export class Calendar {
       const ridKey = keyOf(rid, param(ov, "recurrence-id", "tzid"), ctx);
       skip.add(ridKey);
       if ((param(ov, "recurrence-id", "range") ?? "").toUpperCase() === "THISANDFUTURE") {
-        const s = singleFrom(ov, "");
-        if (!s && !isCancelled(ov)) continue;
+        const ot = readTiming(ov);
+        if (!ot && !isCancelled(ov)) continue;
+        const sameKind = !!ot && ot.allDay === allDay;
         future.push({
           fromKey: ridKey,
-          shift: s ? s.start - ridKey : 0,
-          length: s ? s.end - s.start : 0,
+          shift: ot && sameKind ? ot.start - ridKey : 0,
+          // Keep the change's own length, nominal or exact, so each later occurrence works it out from its own date.
+          length: ot && sameKind ? ot.length : length,
+          zoner: ot && sameKind ? ot.zoner : zoner,
           cancelled: isCancelled(ov),
-          title: s?.title ?? "",
-          location: s?.location ?? "",
+          ...info(ov),
         });
       }
     }
@@ -515,9 +557,16 @@ export class Calendar {
           const startT = period.start;
           if (!isTime(startT)) continue;
           const key = keyOf(startT, pzone, ctx);
-          const endT = period.getEnd();
-          const end = allDay ? Math.max(key + 1, dateDay(endT)) : Math.max(key, zonerFor(endT, pzone ?? tzid).toInstant(wall(endT)));
-          extra.push({ key, end });
+          let end: number;
+          if (period.duration) {
+            // Start + duration: hours are elapsed time, days keep the clock time.
+            const pzoner = zonerFor(startT, pzone ?? tzid);
+            end = allDay ? key + Math.max(1, period.duration.weeks * 7 + period.duration.days) : endOf(wall(startT), key, pzoner, lengthOf(period.duration));
+          } else {
+            const endT = period.getEnd();
+            end = allDay ? Math.max(key + 1, dateDay(endT)) : Math.max(key, zonerFor(endT, pzone ?? tzid).toInstant(wall(endT)));
+          }
+          extra.push({ key, end, period: true });
         }
       }
     }
@@ -555,11 +604,11 @@ export class Calendar {
       }
     }
 
-    let maxLength: number;
-    if (allDay) maxLength = length as number;
-    else if ("exact" in (length as Length)) maxLength = (length as { exact: number }).exact;
-    else maxLength = (length as { days: number; ms: number }).days * DAY_MS + (length as { ms: number }).ms + 3600000;
+    // The longest any occurrence can be, so a day looks back far enough for ones still running.
+    const lengthBound = (l: Length | number) => (allDay ? (l as number) : longest(l as Length));
+    let maxLength = lengthBound(length);
     for (const o of extra) maxLength = Math.max(maxLength, o.end - o.key);
+    for (const f of future) maxLength = Math.max(maxLength, lengthBound(f.length));
 
     const series: Series = {
       id,
@@ -575,7 +624,7 @@ export class Calendar {
       skipDays,
       future,
       shiftMin: Math.min(0, ...future.map((f) => f.shift)),
-      shiftMax: Math.max(0, ...future.map((f) => f.shift + Math.max(0, f.length))),
+      shiftMax: Math.max(0, ...future.map((f) => f.shift)),
       jump,
       states: [],
       windowStart: -Infinity,
@@ -716,7 +765,8 @@ export class Calendar {
       this.ensure(s, lo, hi);
       for (let i = lowerBound(s.starts, lo); i < s.starts.length && s.starts[i] < hi; i++) found.set(s.starts[i], s.ends[i]);
     }
-    for (const o of s.extra) if (o.key >= lo && o.key < hi && !found.has(o.key)) found.set(o.key, o.end);
+    // Extra dates join the set; a PERIOD's own end wins over the series length at the same start.
+    for (const o of s.extra) if (o.key >= lo && o.key < hi && (o.period || !found.has(o.key))) found.set(o.key, o.end);
     const out: (Occurrence & EventInfo)[] = [];
     for (const [key, end] of found) {
       if (s.skip.has(key)) continue;
@@ -724,7 +774,10 @@ export class Calendar {
       for (const f of s.future) if (f.fromKey < key) change = f;
       if (change?.cancelled) continue;
       const start = key + (change?.shift ?? 0);
-      const e = change ? start + change.length : end;
+      let e = end;
+      if (change) {
+        e = s.allDay ? start + (change.length as number) : endOf(change.zoner.wallOf(start), start, change.zoner, change.length as Length);
+      }
       if (start < from || start >= to) continue;
       out.push({ key: start, end: e, title: change?.title ?? s.title, location: change?.location ?? s.location });
     }

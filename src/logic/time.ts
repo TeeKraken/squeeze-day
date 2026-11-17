@@ -158,15 +158,22 @@ export function dayRange(dayNum: number): { start: number; end: number } {
 
 /** The wall clock reading of an instant in a zone. */
 export function wallOfInstant(ms: number, zone: string): Wall {
-  const f = formatterFor(zone)!;
-  const parts: Record<string, number> = {};
-  for (const p of f.formatToParts(new Date(ms))) {
-    if (p.type !== "literal") parts[p.type] = Number(p.value);
-  }
-  return { year: parts.year, month: parts.month, day: parts.day, hour: parts.hour % 24, minute: parts.minute, second: parts.second };
+  return utcWall(ms + offsetAt(zone, ms));
 }
 
-const sameWall = (a: Wall, b: Wall) =>
+/** The UTC fields of an instant, as a clock time. */
+export function utcWall(ms: number): Wall {
+  const d = new Date(ms);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), hour: d.getUTCHours(), minute: d.getUTCMinutes(), second: d.getUTCSeconds() };
+}
+
+/** The device's own clock reading of an instant. */
+export function localWall(ms: number): Wall {
+  const d = new Date(ms);
+  return { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate(), hour: d.getHours(), minute: d.getMinutes(), second: d.getSeconds() };
+}
+
+export const sameWall = (a: Wall, b: Wall) =>
   a.year === b.year && a.month === b.month && a.day === b.day && a.hour === b.hour && a.minute === b.minute && a.second === b.second;
 
 /**
