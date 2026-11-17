@@ -171,4 +171,58 @@ describe("load pipeline", () => {
     expect(world.stored).toBe("C");
     expect(world.active).toBe("C");
   });
+
+  it("review r3 #2: cancelled while activating, a save it made is cleared even when closing the sample", async () => {
+    const { pipeline, world, file } = setup();
+    world.stored = null;
+    const holdActivate = deferred<void>();
+    const realActivate = (pipeline as unknown as { deps: { activate(id: number): Promise<void> } }).deps.activate;
+    (pipeline as unknown as { deps: { activate(id: number): Promise<void> } }).deps.activate = async (id) => {
+      await holdActivate.promise;
+      return realActivate(id);
+    };
+    const b = pipeline.load(file("B"), true, () => false);
+    await tick();
+    await tick();
+    expect(world.stored).toBe("B"); // saved, now waiting on activation
+    const removed = pipeline.remove(false);
+    holdActivate.resolve();
+    expect((await b).status).toBe("cancelled");
+    expect(await removed).toBe(true);
+    expect(world.stored).toBe(null);
+  });
+
+  it("control: closing an ordinary sample still keeps the earlier saved calendar", async () => {
+    const { pipeline, world, file } = setup();
+    await pipeline.load(file("sample"), false, () => true);
+    await pipeline.remove(false);
+    expect(world.stored).toBe("A");
+  });
+
+  it("review r3 #3: a cancelled failed save leaves the older saved calendar alone", async () => {
+    const { pipeline, world, file, log } = setup();
+    const hold = deferred<boolean>();
+    world.holdSave.set("B", hold);
+    const b = pipeline.load(file("B"), true, () => true);
+    await tick();
+    const removed = pipeline.remove(false); // closing the sample while B's write is pending
+    hold.resolve(false); // ...and that write fails
+    expect((await b).status).toBe("cancelled");
+    expect(await removed).toBe(null);
+    expect(world.stored).toBe("A");
+    expect(log).not.toContain("delete");
+  });
+
+  it("review r3 #3: an explicit Remove during a failed save still clears storage", async () => {
+    const { pipeline, world, file } = setup();
+    const hold = deferred<boolean>();
+    world.holdSave.set("B", hold);
+    const b = pipeline.load(file("B"), true, () => true);
+    await tick();
+    const removed = pipeline.remove(true);
+    hold.resolve(false);
+    expect((await b).status).toBe("cancelled");
+    expect(await removed).toBe(true);
+    expect(world.stored).toBe(null);
+  });
 });

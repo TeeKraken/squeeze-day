@@ -80,17 +80,26 @@ export class LoadPipeline<Summary> {
       let kept: Kept = "not-asked";
       if (keep) {
         const before = hadSaved();
-        if (await this.deps.save(files)) kept = "yes";
-        // Don't let an older saved copy quietly come back next time. Nothing
-        // else can touch storage meanwhile, so this only ever clears the older copy.
-        else kept = (await this.deps.removeSaved()) ? "no" : before ? "old-copy-remains" : "no";
+        const ok = await this.deps.save(files);
         if (stale()) {
-          if (kept === "yes") this.orphanSaves++;
+          // Cancelled while saving. A save that went through must not survive
+          // (the queued removal clears it); a failed one changed nothing, so the
+          // older saved copy is left exactly as it was.
+          if (ok) this.orphanSaves++;
           this.deps.discard(loadId);
           return { status: "cancelled" };
         }
+        if (ok) kept = "yes";
+        // Don't let an older saved copy quietly come back next time. Nothing
+        // else can touch storage meanwhile, so this only ever clears the older copy.
+        else kept = (await this.deps.removeSaved()) ? "no" : before ? "old-copy-remains" : "no";
       }
       await this.deps.activate(loadId);
+      if (stale()) {
+        // Cancelled while activating: the page ignores it, and a save it made is cleared.
+        if (kept === "yes") this.orphanSaves++;
+        return { status: "cancelled" };
+      }
       return { status: "loaded", loadId, summary: parsed.summary, files, kept };
     });
   }

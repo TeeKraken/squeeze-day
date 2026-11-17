@@ -104,7 +104,14 @@ interface Occurrence {
 /** A RECURRENCE-ID;RANGE=THISANDFUTURE change: applies to every later occurrence. */
 interface FutureChange extends EventInfo {
   fromKey: number;
+  /** Rough shift as elapsed time (ms, or days for all-day series), for search bounds. */
   shift: number;
+  /**
+   * The shift as calendar days plus clock time in the series' zone, like
+   * ical.js does it: moving Friday 09:00 to Monday 09:00 stays 09:00 on every
+   * later Monday, even across a clock change.
+   */
+  civil: { days: number; ms: number };
   /** The changed length: Length for timed series (kept nominal for day/week DURATIONs), days for all-day ones. */
   length: Length | number;
   zoner: Zoner;
@@ -216,7 +223,6 @@ function zonerFor(t: ICALTime, tzid: string | null): Zoner {
       // ical.js gets that wrong around clock changes.
       const tz = zone as unknown as { utcOffset(t: ICALTime): number };
       const offsetAtWall = (w: Wall) => tz.utcOffset(ICAL.Time.fromData({ ...w, isDate: false }, zone)) * 1000;
-      const toInstant = (w: Wall) => Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - offsetAtWall(w);
       const wallOf = (ms: number) => {
         // Offsets in force within a day either side; keep those that read back consistently.
         const offsets = new Set<number>();
@@ -225,6 +231,16 @@ function zonerFor(t: ICALTime, tzid: string | null): Zoner {
         // Two can fit only in the hour skipped when clocks go forward; the earlier (smaller) offset is the real one there.
         const o = fits.length ? Math.min(...fits) : [...offsets][0];
         return utcWall(ms + o);
+      };
+      // Clock time to instant, read the same way as for zones the browser knows:
+      // a repeated time (clocks going back) is its first occurrence, and a
+      // skipped one (clocks going forward) moves forward past the jump.
+      const toInstant = (w: Wall) => {
+        const asUtc = Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second);
+        const before = offsetAtWall(addDaysToWall(w, -1));
+        const after = offsetAtWall(addDaysToWall(w, 1));
+        const fits = [before, after].map((o) => asUtc - o).filter((t) => sameWall(wallOf(t), w));
+        return fits.length ? Math.min(...fits) : asUtc - before;
       };
       // A clock time exists if turning it into an instant and back gives it again.
       return { toInstant, wallOf, exists: (w) => sameWall(wallOf(toInstant(w)), w) };
@@ -363,6 +379,23 @@ function parseLeniently(t: string): { parsed: unknown; dropped: number } | null 
   } catch {
     return null;
   }
+}
+
+/** The calendar-day and clock-time difference between two instants, read in a zone. */
+function civilShift(allDay: boolean, zoner: Zoner, from: number, to: number): { days: number; ms: number } {
+  if (allDay) return { days: to - from, ms: 0 };
+  const a = zoner.wallOf(from);
+  const b = zoner.wallOf(to);
+  const clock = (w: Wall) => ((w.hour * 60 + w.minute) * 60 + w.second) * 1000;
+  return { days: dateDay(b) - dateDay(a), ms: clock(b) - clock(a) };
+}
+
+/** Moves an occurrence by calendar days and clock time in the series' zone, then reads it as an instant. */
+function applyCivil(s: { allDay: boolean; zoner: Zoner }, key: number, shift: { days: number; ms: number }): number {
+  if (s.allDay) return key + shift.days;
+  const w = s.zoner.wallOf(key);
+  const moved = utcWall(Date.UTC(w.year, w.month - 1, w.day + shift.days, w.hour, w.minute, w.second) + shift.ms);
+  return s.zoner.toInstant(moved);
 }
 
 function lowerBound(arr: number[], x: number): number {
@@ -517,6 +550,7 @@ export class Calendar {
         future.push({
           fromKey: ridKey,
           shift: ot && sameKind ? ot.start - ridKey : 0,
+          civil: ot && sameKind ? civilShift(allDay, zoner, ridKey, ot.start) : { days: 0, ms: 0 },
           // Keep the change's own length, nominal or exact, so each later occurrence works it out from its own date.
           length: ot && sameKind ? ot.length : length,
           zoner: ot && sameKind ? ot.zoner : zoner,
@@ -589,6 +623,13 @@ export class Calendar {
       const stripped = recur.clone();
       stripped.count = null as unknown as number;
       stripped.until = null as unknown as ICALTime;
+      // A plain yearly rule starting on 29 February means "every 29 February"
+      // (ical.js would roll it to 1 March in other years and use up COUNT).
+      const parts = (stripped as unknown as { parts: Record<string, unknown[]> }).parts;
+      if (stripped.freq === "YEARLY" && d0.month === 2 && d0.day === 29 && Object.keys(parts).length === 0) {
+        parts.BYMONTH = [2];
+        parts.BYMONTHDAY = [29];
+      }
       rules.push({ recur: stripped, count: recur.count ? Number(recur.count) : null, untilKey, untilDay });
     }
 
@@ -623,8 +664,9 @@ export class Calendar {
       skip,
       skipDays,
       future,
-      shiftMin: Math.min(0, ...future.map((f) => f.shift)),
-      shiftMax: Math.max(0, ...future.map((f) => f.shift)),
+      // Clock-time shifts can differ from elapsed time by a clock change: allow an hour either way.
+      shiftMin: Math.min(0, ...future.map((f) => f.shift - (allDay ? 0 : 3600000))),
+      shiftMax: Math.max(0, ...future.map((f) => f.shift + (allDay ? 0 : 3600000))),
       jump,
       states: [],
       windowStart: -Infinity,
@@ -773,7 +815,7 @@ export class Calendar {
       let change: FutureChange | null = null;
       for (const f of s.future) if (f.fromKey < key) change = f;
       if (change?.cancelled) continue;
-      const start = key + (change?.shift ?? 0);
+      const start = change ? applyCivil(s, key, change.civil) : key;
       let e = end;
       if (change) {
         e = s.allDay ? start + (change.length as number) : endOf(change.zoner.wallOf(start), start, change.zoner, change.length as Length);
