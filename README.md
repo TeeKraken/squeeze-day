@@ -6,6 +6,8 @@
 
 A calendar day view for your phone that keeps every appointment readable and folds long empty stretches into thin strips labelled with their length ("2 h 30 free"), so more of the day fits on one screen.
 
+**Use it:** https://squeeze-day.vercel.app (free, no sign-up; your calendar stays on your device).
+
 ![The sample day: appointments at a readable size, long free stretches folded into thin labelled strips](screenshot-1280x800.png)
 
 ## What it does
@@ -67,7 +69,7 @@ pnpm build     # production build into dist/
 
 Tests run as if the device were in New York (so daylight saving is exercised even on CI machines in UTC) and cover UTC, `TZID` (with and without a definition in the file, Windows and prefixed names), floating and all-day times, events spanning midnight, daily, weekly, monthly and yearly repeats, `UNTIL` cut-offs on both sides of UTC, `EXDATE`, `RDATE` (own zones and `PERIOD`), moved, cancelled and "this and future" changes, skipped clock hours, day-long `DURATION`s across daylight saving, files with broken parts, jumping ahead in long series (checked against walking every occurrence), a multi-megabyte calendar, the layout rules (including time taken by a whole-day event), and the sample calendar. `src/test-fixtures/` holds the small calendars from the review that found these cases.
 
-It is a static site (Vite + vanilla TypeScript, with ical.js as its one runtime dependency) with no environment variables, secrets or backend. It's deployed on Vercel's free tier.
+It is a static site (Vite + vanilla TypeScript, with ical.js as its one runtime dependency) with no environment variables, secrets or backend. It's deployed on Vercel's free tier at https://squeeze-day.vercel.app.
 
 ## Maintenance
 
