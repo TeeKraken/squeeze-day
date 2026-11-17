@@ -72,6 +72,11 @@ export interface CalendarSummary {
   calendars: number;
   /** Events the app couldn't read at all (no usable start time, or a repeat rule it can't follow). */
   unreadable: number;
+  /**
+   * Repeating events changed "from here on" between all-day and timed. The
+   * app keeps showing them the original way (with the new title), and says so.
+   */
+  kindChanges: number;
 }
 
 /** How long an event lasts: exact elapsed time, or calendar days/weeks plus a time (keeps the clock time across DST). */
@@ -422,6 +427,7 @@ export class Calendar {
   readonly summary: CalendarSummary;
 
   private readonly jumpAhead: boolean;
+  private kindChanges = 0;
 
   /** `jumpAhead: false` walks every series from its start (used by tests to check jumping). */
   constructor(texts: string[], options: { jumpAhead?: boolean } = {}) {
@@ -522,7 +528,7 @@ export class Calendar {
         `None of the events in this file could be read (${unreadable === 1 ? "1 event" : `${unreadable} events`}), so it wasn't opened. Try exporting your calendar again.`,
       );
     }
-    this.summary = { events: singles.length + this.series.length, recurring: this.series.length, calendars, unreadable };
+    this.summary = { events: singles.length + this.series.length, recurring: this.series.length, calendars, unreadable, kindChanges: this.kindChanges };
   }
 
   private readSeries(comp: ICALComponent, id: string, overrides: ICALComponent[]): Series | null {
@@ -547,6 +553,7 @@ export class Calendar {
         const ot = readTiming(ov);
         if (!ot && !isCancelled(ov)) continue;
         const sameKind = !!ot && ot.allDay === allDay;
+        if (ot && !sameKind) this.kindChanges++;
         future.push({
           fromKey: ridKey,
           shift: ot && sameKind ? ot.start - ridKey : 0,
@@ -664,9 +671,12 @@ export class Calendar {
       skip,
       skipDays,
       future,
-      // Clock-time shifts can differ from elapsed time by a clock change: allow an hour either way.
-      shiftMin: Math.min(0, ...future.map((f) => f.shift - (allDay ? 0 : 3600000))),
-      shiftMax: Math.max(0, ...future.map((f) => f.shift + (allDay ? 0 : 3600000))),
+      // A clock-time shift is a different elapsed time at every clock change
+      // (and differs again between the series' zone and the device's), so the
+      // search is padded by a whole day each way; each moved occurrence is then
+      // checked exactly against the day being viewed.
+      shiftMin: Math.min(0, ...future.map((f) => f.shift - (allDay ? 1 : DAY_MS))),
+      shiftMax: Math.max(0, ...future.map((f) => f.shift + (allDay ? 1 : DAY_MS))),
       jump,
       states: [],
       windowStart: -Infinity,

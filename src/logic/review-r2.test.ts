@@ -132,6 +132,6 @@ describe("#8 a file whose every event failed", () => {
 
   it("an honestly empty calendar is still fine", () => {
     const cal = new Calendar(["BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR"]);
-    expect(cal.summary).toEqual({ events: 0, recurring: 0, calendars: 1, unreadable: 0 });
+    expect(cal.summary).toEqual({ events: 0, recurring: 0, calendars: 1, unreadable: 0, kindChanges: 0 });
   });
 });

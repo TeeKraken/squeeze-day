@@ -200,6 +200,6 @@ describe("#3 timed events covering the whole day", () => {
 describe("#11 summary", () => {
   it("doesn't claim a date range", () => {
     const cal = new Calendar([fixture("future-override")]);
-    expect(Object.keys(cal.summary).sort()).toEqual(["calendars", "events", "recurring", "unreadable"]);
+    expect(Object.keys(cal.summary).sort()).toEqual(["calendars", "events", "kindChanges", "recurring", "unreadable"]);
   });
 });

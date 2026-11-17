@@ -189,9 +189,14 @@ function showDayview(): void {
   const s = state.summary!;
   const what = state.mode === "sample" ? "The sample calendar" : state.names.length === 1 ? `"${state.names[0]}"` : `${state.names.length} calendars`;
   calInfo.textContent = `${what}: ${s.events.toLocaleString()} ${s.events === 1 ? "event" : "events"}${s.recurring ? ` (${s.recurring.toLocaleString()} repeating)` : ""}.`;
-  calWarn.textContent = s.unreadable
-    ? `${s.unreadable.toLocaleString()} ${s.unreadable === 1 ? "event" : "events"} in this file couldn't be read, so ${s.unreadable === 1 ? "it isn't" : "they aren't"} shown. Check them in your calendar app.`
-    : "";
+  const warnings: string[] = [];
+  if (s.unreadable)
+    warnings.push(`${s.unreadable.toLocaleString()} ${s.unreadable === 1 ? "event" : "events"} in this file couldn't be read, so ${s.unreadable === 1 ? "it isn't" : "they aren't"} shown. Check them in your calendar app.`);
+  if (s.kindChanges)
+    warnings.push(
+      `${s.kindChanges === 1 ? "A repeating event was" : `${s.kindChanges} repeating events were`} changed between all-day and a set time "from here on". This app keeps showing ${s.kindChanges === 1 ? "it" : "them"} the original way, with the new name, so check the times in your calendar app.`,
+    );
+  calWarn.textContent = warnings.join(" ");
   if (state.mode === "sample") calKeep.textContent = "The sample isn't kept. Add your own calendar to keep it on this device.";
   else if (state.kept === "yes") calKeep.textContent = "Your calendar stays on this device, so it's here when you come back. It's a copy: add a newer copy to see later changes.";
   else if (state.kept === "old-copy-remains")
