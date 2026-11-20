@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://squeeze-day.vercel.app/sitemap.xml
